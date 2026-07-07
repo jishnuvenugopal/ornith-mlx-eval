@@ -11,3 +11,5 @@ __pycache__/
 
 benchmark_results/
 *.log
+
+.DS_Store

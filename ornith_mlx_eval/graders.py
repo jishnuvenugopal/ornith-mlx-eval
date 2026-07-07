@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from ornith_mlx_eval.parsing import ParseResult, CodeExtractionResult, extract_fenced_code
+from ornith_mlx_eval.sandbox import run_code as run_in_sandbox
 
 
 # ---------------------------------------------------------------------------
@@ -376,16 +377,20 @@ def grade_code(
     expected: Any,
     options: dict[str, Any],
 ) -> GradeResult:
-    """Code grading via fenced Python code extraction.
+    """Code grading via fenced Python code extraction and sandbox execution.
 
     Extracts a single fenced Python code block from the final text and
-    prepares it for sandbox execution.  The actual sandbox execution is
-    performed by the sandbox module; this grader handles extraction and
-    validation only.
+    executes it inside the bounded subprocess sandbox.
 
-    The *expected* value for code graders is typically a boolean ``True``
-    (meaning "the code should pass its tests") or a dict describing
-    test inputs and expected outputs.
+    Options:
+        *test_input* (str): Optional text piped to the candidate process
+            stdin.
+        *expected_output* (str): Optional expected stdout for comparison.
+        *timeout* (float): Per-run timeout in seconds (default 10.0).
+        *max_output_bytes* (int): Max captured stdout bytes.
+
+    If neither *test_input* nor *expected_output* is provided, the code
+    passes when it exits with code 0.
     """
     if not final_text:
         return _fail("code", "Empty final text", final_text)
@@ -406,21 +411,35 @@ def grade_code(
                      reason_map.get(extraction.status, f"Code extraction failed: {extraction.status}"),
                      final_text)
 
-    # Code was successfully extracted.  At this point the code is ready
-    # for sandbox execution.  The sandbox module (sandbox.py) will handle
-    # actual execution with timeout, environment scrubbing, etc.
-    #
-    # The grader reports successful extraction; whether the code passes
-    # execution-level tests is determined by the sandbox.
-    evidence = extraction.code
+    # -- Sandbox execution ----------------------------------------------------
+    code_text = extraction.code
+    test_input = options.get("test_input", None)
+    expected_output = options.get("expected_output", None)
+    sandbox_timeout = float(options.get("timeout", 10.0))
+    max_output = int(options.get("max_output_bytes", 1024 * 1024))
 
-    return GradeResult(
-        passed=True,
-        score=1.0,
-        reason=f"Python code extracted successfully ({len(extraction.code)} chars)",
-        evidence=evidence,
-        grader_type="code",
+    sandbox_result = run_in_sandbox(
+        code=code_text,
+        test_input=test_input,
+        expected_output=expected_output,
+        timeout=sandbox_timeout,
+        max_output_bytes=max_output,
     )
+
+    if sandbox_result.passed:
+        return GradeResult(
+            passed=True,
+            score=1.0,
+            reason=f"Code executed successfully in sandbox: {sandbox_result.reason}",
+            evidence=code_text,
+            grader_type="code",
+        )
+    else:
+        return _fail(
+            "code",
+            f"Sandbox execution failed: {sandbox_result.reason}",
+            code_text,
+        )
 
 
 # ---------------------------------------------------------------------------
