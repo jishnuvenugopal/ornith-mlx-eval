@@ -48,6 +48,39 @@ SEMANTIC_PROMPT_FIELDS: frozenset[str] = KNOWN_PROMPT_FIELDS - {"_ext"}
 SEMANTIC_EXPECTED_ANSWER_FIELDS: frozenset[str] = KNOWN_EXPECTED_ANSWER_FIELDS - {"_ext"}
 SEMANTIC_GRADER_FIELDS: frozenset[str] = KNOWN_GRADER_FIELDS - {"_ext"}
 
+# Per-grader-type option validation schema.
+#   allowed  — option keys that this grader type accepts
+#   required — option keys that must be present (code grader needs
+#              test_input + expected_output; numeric tolerance is optional)
+#   types    — expected Python type(s) for each option value
+GRADER_OPTIONS_SCHEMA: dict[str, dict[str, Any]] = {
+    "exact_match": {
+        "allowed": frozenset({"ignore_case", "strip_whitespace"}),
+        "required": frozenset(),
+        "types": {"ignore_case": bool, "strip_whitespace": bool},
+    },
+    "contains": {
+        "allowed": frozenset({"ignore_case", "strip_whitespace"}),
+        "required": frozenset(),
+        "types": {"ignore_case": bool, "strip_whitespace": bool},
+    },
+    "numeric": {
+        "allowed": frozenset({"tolerance"}),
+        "required": frozenset(),  # tolerance is optional (defaults to 0)
+        "types": {"tolerance": (int, float)},
+    },
+    "json_match": {
+        "allowed": frozenset(),
+        "required": frozenset(),
+        "types": {},
+    },
+    "code": {
+        "allowed": frozenset({"test_input", "expected_output"}),
+        "required": frozenset({"test_input", "expected_output"}),
+        "types": {},
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Public API – discovery
 # ---------------------------------------------------------------------------
@@ -221,6 +254,7 @@ def validate_suite(
                         f"supported: {', '.join(sorted(SUPPORTED_GRADERS))}"
                     )
             _check_unknown_fields(grader, KNOWN_GRADER_FIELDS, f"{prefix}grader.", errors)
+            _validate_grader_options(grader, prefix, errors)
 
     if errors:
         _add_path_context(errors, suite_path)
@@ -242,18 +276,113 @@ def _check_unknown_fields(
     errors: list[str],
 ) -> None:
     """Reject unknown fields that are not under the _ext namespace."""
+    p = prefix.rstrip()  # normalise so we always control the trailing space
     for key in obj:
         if key.startswith("_"):
             if key == "_ext":
                 if isinstance(obj[key], dict):
                     continue
-                errors.append(f"{prefix}field '_ext' must be an object")
+                errors.append(f"{p} field '_ext' must be an object")
                 continue
             # Any _-prefixed key other than _ext is unknown
-            errors.append(f"{prefix}unknown field: '{key}'")
+            errors.append(f"{p} unknown field: '{key}'")
             continue
         if key not in known:
-            errors.append(f"{prefix}unknown field: '{key}'")
+            errors.append(f"{p} unknown field: '{key}'")
+
+
+def _validate_grader_options(
+    grader: dict[str, Any],
+    prefix: str,
+    errors: list[str],
+) -> None:
+    """Validate grader options against the per-type option schema.
+
+    Checks:
+      * Required options are present
+      * Unknown options are rejected
+      * Option value types are compatible
+    """
+    gtype = grader.get("type", "")
+    if gtype not in SUPPORTED_GRADERS:
+        return  # unknown grader type already reported by caller
+
+    schema = GRADER_OPTIONS_SCHEMA.get(gtype)
+    if schema is None:
+        return
+
+    p = prefix.rstrip()
+    opt_prefix = f"{p} grader.options"
+
+    options = grader.get("options")
+    if not isinstance(options, dict):
+        # Missing or non-dict options – check required
+        if schema["required"]:
+            for key in sorted(schema["required"]):
+                errors.append(
+                    f"{opt_prefix} missing required option '{key}' "
+                    f"for grader type '{gtype}'"
+                )
+        return
+
+    # Check required options
+    for key in sorted(schema["required"]):
+        if key not in options:
+            errors.append(
+                f"{opt_prefix} missing required option '{key}' "
+                f"for grader type '{gtype}'"
+            )
+
+    # Check for unknown options
+    for key in options:
+        if key.startswith("_"):
+            if key == "_ext":
+                if isinstance(options[key], dict):
+                    continue
+                errors.append(f"{opt_prefix}._ext must be an object")
+                continue
+            errors.append(
+                f"{opt_prefix} unknown option '{key}' "
+                f"for grader type '{gtype}'"
+            )
+            continue
+        if key not in schema["allowed"]:
+            errors.append(
+                f"{opt_prefix} unknown option '{key}' "
+                f"for grader type '{gtype}'"
+            )
+
+    # Check option value types
+    for key, expected_type in schema["types"].items():
+        if key not in options:
+            continue
+        value = options[key]
+        if value is None:
+            errors.append(
+                f"{opt_prefix}.{key} must not be null "
+                f"for grader type '{gtype}'"
+            )
+            continue
+        # bool is a subclass of int in Python, so isinstance(True, (int,float))
+        # passes even though we want to reject booleans for numeric tolerance.
+        if isinstance(value, bool) and (int, float) == expected_type:
+            errors.append(
+                f"{opt_prefix}.{key} must be int or float, "
+                f"got bool for grader type '{gtype}'"
+            )
+            continue
+        if not isinstance(value, expected_type):
+            if isinstance(expected_type, tuple):
+                type_names = " or ".join(
+                    t.__name__ for t in expected_type
+                )
+            else:
+                type_names = expected_type.__name__
+            errors.append(
+                f"{opt_prefix}.{key} must be {type_names}, "
+                f"got {type(value).__name__} "
+                f"for grader type '{gtype}'"
+            )
 
 
 def _add_path_context(errors: list[str], suite_path: str) -> None:

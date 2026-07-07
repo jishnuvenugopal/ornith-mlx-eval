@@ -346,19 +346,365 @@ class TestUnsupportedGrader:
         result = _cli(["validate-suite", str(path)])
         assert result.returncode != 0
 
-    @pytest.mark.parametrize("grader_type", [
-        "exact_match",
-        "contains",
-        "numeric",
-        "json_match",
-        "code",
+    @pytest.mark.parametrize("grader_type,grader_options", [
+        ("exact_match", {}),
+        ("contains", {}),
+        ("numeric", {"tolerance": 0.01}),
+        ("json_match", {}),
+        ("code", {"test_input": 5, "expected_output": 10}),
     ])
-    def test_supported_grader_passes(self, tmp_path, grader_type):
+    def test_supported_grader_passes(self, tmp_path, grader_type, grader_options):
         data = _minimal_suite()
         data["cases"][0]["grader"]["type"] = grader_type
+        if grader_options:
+            data["cases"][0]["grader"]["options"] = grader_options
         path = _write_suite(data, cwd=str(tmp_path))
         result = _cli(["validate-suite", str(path)])
         assert result.returncode == 0, f"grader '{grader_type}' should pass"
+
+
+# ======================================================================
+# Grader option validation – code grader requires test_input/expected_output
+# ======================================================================
+
+class TestCodeGraderOptions:
+    """Code graders must require options.test_input and options.expected_output."""
+
+    def test_code_grader_with_required_options_passes(self, tmp_path):
+        """A code grader with test_input and expected_output should pass."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"] = {
+            "type": "code",
+            "options": {"test_input": 5, "expected_output": 10},
+        }
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode == 0, (
+            f"code grader with required options should pass; stderr={result.stderr!r}"
+        )
+
+    def test_code_grader_missing_test_input_fails(self, tmp_path):
+        """Code grader without test_input should fail validation."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"] = {
+            "type": "code",
+            "options": {"expected_output": 10},
+        }
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0, (
+            f"code grader missing test_input should fail; stderr={result.stderr!r}"
+        )
+
+    def test_code_grader_missing_expected_output_fails(self, tmp_path):
+        """Code grader without expected_output should fail validation."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"] = {
+            "type": "code",
+            "options": {"test_input": 5},
+        }
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0, (
+            f"code grader missing expected_output should fail; stderr={result.stderr!r}"
+        )
+
+    def test_code_grader_missing_both_options_fails(self, tmp_path):
+        """Code grader without any options should fail validation."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"] = {
+            "type": "code",
+            "options": {},
+        }
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0, (
+            f"code grader with empty options should fail; stderr={result.stderr!r}"
+        )
+
+    def test_code_grader_no_options_key_fails(self, tmp_path):
+        """Code grader without an options key at all should fail."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"] = {"type": "code"}
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0, (
+            f"code grader without options should fail; stderr={result.stderr!r}"
+        )
+
+    def test_validation_error_identifies_case_and_option_path(self, tmp_path):
+        """Validation errors should identify the offending case and option path."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"] = {"type": "code", "options": {}}
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0
+        # stderr should reference the case and the missing option
+        combined = result.stderr.lower()
+        assert "case" in combined or "case[0]" in combined, (
+            f"expected case reference in stderr: {result.stderr!r}"
+        )
+
+
+# ======================================================================
+# Grader option validation – numeric grader rejects nonnumeric tolerance
+# ======================================================================
+
+class TestNumericGraderOptions:
+    """Numeric graders must reject nonnumeric tolerance values."""
+
+    def test_numeric_grader_with_numeric_tolerance_passes(self, tmp_path):
+        """Numeric graders with int or float tolerance should pass."""
+        for tol in [0.01, 1, 0, 0.5]:
+            data = _minimal_suite()
+            data["cases"][0]["grader"] = {
+                "type": "numeric",
+                "options": {"tolerance": tol},
+            }
+            path = _write_suite(data, cwd=str(tmp_path))
+            result = _cli(["validate-suite", str(path)])
+            assert result.returncode == 0, (
+                f"numeric grader with tolerance {tol!r} should pass; "
+                f"stderr={result.stderr!r}"
+            )
+
+    def test_numeric_grader_string_tolerance_fails(self, tmp_path):
+        """Numeric grader with a string tolerance should fail validation."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"] = {
+            "type": "numeric",
+            "options": {"tolerance": "0.01"},
+        }
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0, (
+            f"numeric grader with string tolerance should fail; stderr={result.stderr!r}"
+        )
+
+    def test_numeric_grader_boolean_tolerance_fails(self, tmp_path):
+        """Numeric grader with a boolean tolerance should fail validation."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"] = {
+            "type": "numeric",
+            "options": {"tolerance": True},
+        }
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0, (
+            f"numeric grader with boolean tolerance should fail; stderr={result.stderr!r}"
+        )
+
+    def test_numeric_grader_null_tolerance_fails(self, tmp_path):
+        """Numeric grader with a null tolerance should fail validation."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"] = {
+            "type": "numeric",
+            "options": {"tolerance": None},
+        }
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0, (
+            f"numeric grader with null tolerance should fail; stderr={result.stderr!r}"
+        )
+
+    def test_numeric_grader_tolerance_error_identifies_case_and_path(self, tmp_path):
+        """Error messages for bad tolerance should identify case and grader option path."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"] = {
+            "type": "numeric",
+            "options": {"tolerance": "abc"},
+        }
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0
+        combined = (result.stderr + result.stdout).lower()
+        assert "tolerance" in combined, (
+            f"expected 'tolerance' mentioned in error: {result.stderr!r}"
+        )
+
+
+# ======================================================================
+# Grader option validation – unsupported or incompatible grader options
+# ======================================================================
+
+class TestUnsupportedGraderOptions:
+    """Unsupported or unknown grader options must fail validation."""
+
+    def test_exact_match_with_unknown_option_fails(self, tmp_path):
+        """Unknown option on exact_match grader should fail."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"] = {
+            "type": "exact_match",
+            "options": {"tolerance": 0.01},  # tolerance not valid for exact_match
+        }
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0, (
+            f"unsupported option on exact_match should fail; stderr={result.stderr!r}"
+        )
+
+    def test_contains_with_unknown_option_fails(self, tmp_path):
+        """Unknown option on contains grader should fail."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"] = {
+            "type": "contains",
+            "options": {"test_input": 1},  # not valid for contains
+        }
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0, (
+            f"unsupported option on contains should fail; stderr={result.stderr!r}"
+        )
+
+    def test_json_match_with_unknown_option_fails(self, tmp_path):
+        """Unknown option on json_match grader should fail."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"] = {
+            "type": "json_match",
+            "options": {"ignore_case": True},  # not valid for json_match
+        }
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0, (
+            f"unsupported option on json_match should fail; stderr={result.stderr!r}"
+        )
+
+    def test_code_grader_with_unknown_option_fails(self, tmp_path):
+        """Unknown option on code grader beyond test_input/expected_output should fail."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"] = {
+            "type": "code",
+            "options": {
+                "test_input": 5,
+                "expected_output": 10,
+                "extra_option": "bad",
+            },
+        }
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0, (
+            f"unknown option on code grader should fail; stderr={result.stderr!r}"
+        )
+
+    def test_numeric_grader_with_unknown_option_fails(self, tmp_path):
+        """Unknown option on numeric grader beyond tolerance should fail."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"] = {
+            "type": "numeric",
+            "options": {
+                "tolerance": 0.1,
+                "extra_option": "bad",
+            },
+        }
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0, (
+            f"unknown option on numeric grader should fail; stderr={result.stderr!r}"
+        )
+
+    def test_unsupported_option_error_has_clear_path(self, tmp_path):
+        """Error messages for unsupported options should show grader option path."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"] = {
+            "type": "exact_match",
+            "options": {"tolerance": 0.01},
+        }
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0
+        combined = (result.stderr + result.stdout).lower()
+        # Should mention grader / options / the bad key
+        assert "grader" in combined or "option" in combined or "tolerance" in combined, (
+            f"expected grader option path in error: {result.stderr!r}"
+        )
+
+
+# ======================================================================
+# Error message spacing – unknown-field errors have correct spacing
+# ======================================================================
+
+class TestErrorMessageSpacing:
+    """Unknown-field error messages must include correct spacing between prefix
+    and the error description."""
+
+    def test_top_level_unknown_field_has_space_before_error(self, tmp_path):
+        """The error for an unknown top-level field should have a space before 'unknown'."""
+        data = _minimal_suite()
+        data["typo_field"] = "value"
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0
+        # The error should NOT have prefix glued to "unknown" without a space.
+        # e.g. "top-levelunknown field: 'typo_field'" is wrong
+        # It should be "top-level unknown field: 'typo_field'" or similar with space
+        combined = result.stderr + result.stdout
+        # "unknown field:" should appear with a space before it from the prefix
+        assert "unknown field:" in combined.lower(), (
+            f"expected 'unknown field:' in output: {result.stderr!r}"
+        )
+        # Check that there's no "top-levelunknown" merged token
+        assert "top-levelunknown" not in combined, (
+            f"error message has missing space before 'unknown': {result.stderr!r}"
+        )
+
+    def test_case_level_unknown_field_has_space_before_error(self, tmp_path):
+        """The error for an unknown case-level field should have space around prefix."""
+        data = _minimal_suite()
+        data["cases"][0]["bad_case_field"] = "value"
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0
+        combined = result.stderr + result.stdout
+        # Check that prefix like "case[0] " is properly separated
+        if "unknown field" in combined.lower():
+            # No merged tokens like "case[0]unknown"
+            import re
+            # Should not have case[N] immediately followed by "unknown" without space
+            assert not re.search(r'case\[\d+\]unknown', combined.lower()), (
+                f"case prefix merged with 'unknown': {result.stderr!r}"
+            )
+
+    def test_prompt_level_unknown_field_has_space_before_error(self, tmp_path):
+        """The error for an unknown prompt-level field should have spaced prefix."""
+        data = _minimal_suite()
+        data["cases"][0]["prompt"]["bad_prompt_field"] = "value"
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0
+        combined = result.stderr + result.stdout
+        if "unknown field" in combined.lower():
+            import re
+            assert not re.search(r'prompt\.unknown', combined.lower()), (
+                f"prompt prefix merged with 'unknown': {result.stderr!r}"
+            )
+
+    def test_expected_answer_level_unknown_field_has_space_before_error(self, tmp_path):
+        """The error for an unknown expected_answer field should have spacing."""
+        data = _minimal_suite()
+        data["cases"][0]["expected_answer"]["bad_ea_field"] = "value"
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0
+        combined = result.stderr + result.stdout
+        if "unknown field" in combined.lower():
+            import re
+            assert not re.search(r'expected_answer\.unknown', combined.lower()), (
+                f"expected_answer prefix merged with 'unknown': {result.stderr!r}"
+            )
+
+    def test_grader_level_unknown_field_has_space_before_error(self, tmp_path):
+        """The error for an unknown grader field should have spacing."""
+        data = _minimal_suite()
+        data["cases"][0]["grader"]["bad_grader_field"] = "value"
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0
+        combined = result.stderr + result.stdout
+        if "unknown field" in combined.lower():
+            import re
+            assert not re.search(r'grader\.unknown', combined.lower()), (
+                f"grader prefix merged with 'unknown': {result.stderr!r}"
+            )
 
 
 # ======================================================================
