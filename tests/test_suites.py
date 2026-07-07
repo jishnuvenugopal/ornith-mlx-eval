@@ -433,12 +433,13 @@ class TestSuiteHashChanges:
     """Suite hash changes when scored content changes."""
 
     def test_different_case_content_different_hash(self, tmp_path):
+        """Changing scored content (expected_answer) changes suite hash."""
         path_a = Path(tmp_path) / "a.json"
         path_b = Path(tmp_path) / "b.json"
         data_a = _minimal_suite()
         data_b = _minimal_suite()
-        data_a["cases"][0]["prompt"]["user_template"] = "What is the capital of France?"
-        data_b["cases"][0]["prompt"]["user_template"] = "What is the capital of Germany?"
+        data_a["cases"][0]["expected_answer"]["hidden_answer"] = "Paris"
+        data_b["cases"][0]["expected_answer"]["hidden_answer"] = "Berlin"
         path_a.write_text(json.dumps(data_a), encoding="utf-8")
         path_b.write_text(json.dumps(data_b), encoding="utf-8")
         ha = _cli(["validate-suite", str(path_a)])
@@ -888,6 +889,38 @@ class TestLeakageNormalization:
         result = _cli(["validate-suite", str(path)])
         assert result.returncode != 0
 
+    def test_json_unicode_escape_leak_fails(self, tmp_path):
+        """VAL-EVAL-033: Unicode-escaped answer in visible field fails leakage."""
+        # \u0050\u0061\u0072\u0069\u0073 = Paris
+        data = _minimal_suite()
+        data["description"] = "Answer is \\u0050\\u0061\\u0072\\u0069\\u0073"
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0, (
+            f"unicode-escaped answer should fail leakage: {result.stderr!r}"
+        )
+
+    def test_json_string_escape_leak_fails(self, tmp_path):
+        """VAL-EVAL-033: JSON-string-escaped answer in visible field fails leakage."""
+        # \"Paris\" with JSON quotes
+        data = _minimal_suite()
+        data["description"] = 'Expected output is \\"Paris\\"'
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0, (
+            f"json-string-escaped answer should fail leakage: {result.stderr!r}"
+        )
+
+    def test_json_backslash_escaped_answer_leak_fails(self, tmp_path):
+        """VAL-EVAL-033: Backslash-escaped quotes around answer fail leakage."""
+        data = _minimal_suite()
+        data["description"] = "The value was \\\"Paris\\\" in the response"
+        path = _write_suite(data, cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode != 0, (
+            f"backslash-escaped answer should fail leakage: {result.stderr!r}"
+        )
+
     def test_non_match_passes(self, tmp_path):
         """Unrelated words should not trigger leakage."""
         data = _minimal_suite()
@@ -956,6 +989,25 @@ class TestNonMutating:
 # VAL-EVAL-006 / VAL-EVAL-007 – Prompt-template hash
 # ======================================================================
 
+def _extract_prompt_template_hash(stdout: str) -> str:
+    """Extract the prompt-template hash from validate-suite stdout.
+
+    Looks for 'Prompt-template hash:' label first, then falls back
+    to the second hex-like hash in the output (after suite hash).
+    """
+    import re
+    # Explicit label match
+    for line in stdout.splitlines():
+        m = re.search(r'Prompt-template\s+hash[:\s]*([0-9a-fA-F]{8,})', line, re.IGNORECASE)
+        if m:
+            return m.group(1).lower()
+    # Fallback: collect all hex hashes and return the second
+    hashes = re.findall(r'\b([0-9a-fA-F]{32,})\b', stdout)
+    if len(hashes) >= 2:
+        return hashes[1].lower()
+    return ""
+
+
 class TestPromptTemplateHash:
     """Prompt-template hash is recorded and changes with assembly changes."""
 
@@ -967,8 +1019,9 @@ class TestPromptTemplateHash:
         # Should mention prompt template hash in output
         assert "prompt" in result.stdout.lower() and ("hash" in result.stdout.lower())
 
-    def test_prompt_template_hash_different_for_different_system_prompt(self, tmp_path):
-        """Different system prompts should yield different prompt-template hashes."""
+    def test_system_prompt_changes_prompt_template_hash_not_suite_hash(self, tmp_path):
+        """VAL-EVAL-007: Different system prompts should yield different
+        prompt-template hashes but identical suite hashes."""
         path_a = Path(tmp_path) / "a.json"
         path_b = Path(tmp_path) / "b.json"
         data_a = _minimal_suite()
@@ -981,10 +1034,83 @@ class TestPromptTemplateHash:
         rb = _cli(["validate-suite", str(path_b)])
         assert ra.returncode == 0
         assert rb.returncode == 0
-        # Suite hashes should be the same since everything else is identical
-        ha = _extract_hash(ra.stdout)
-        hb = _extract_hash(rb.stdout)
-        assert ha != hb, "suite hash should differ with different system prompts"
+        # Suite hashes should be IDENTICAL (prompt assembly excluded)
+        sha = _extract_hash(ra.stdout)
+        shb = _extract_hash(rb.stdout)
+        assert sha == shb, (
+            f"suite hash should NOT change with system prompt: {sha} vs {shb}"
+        )
+        # Prompt-template hashes should differ
+        pta = _extract_prompt_template_hash(ra.stdout)
+        ptb = _extract_prompt_template_hash(rb.stdout)
+        assert pta and ptb, "prompt-template hashes must be nonempty"
+        assert pta != ptb, (
+            f"prompt-template hash should differ with system prompt: {pta} == {ptb}"
+        )
+
+    def test_user_template_changes_prompt_template_hash_not_suite_hash(self, tmp_path):
+        """VAL-EVAL-007: Different user_templates should yield different
+        prompt-template hashes but identical suite hashes."""
+        path_a = Path(tmp_path) / "a.json"
+        path_b = Path(tmp_path) / "b.json"
+        data_a = _minimal_suite()
+        data_b = _minimal_suite()
+        data_a["cases"][0]["prompt"]["user_template"] = "What is the capital of France?"
+        data_b["cases"][0]["prompt"]["user_template"] = "Name France's capital."
+        path_a.write_text(json.dumps(data_a), encoding="utf-8")
+        path_b.write_text(json.dumps(data_b), encoding="utf-8")
+        ra = _cli(["validate-suite", str(path_a)])
+        rb = _cli(["validate-suite", str(path_b)])
+        assert ra.returncode == 0
+        assert rb.returncode == 0
+        # Suite hashes should be IDENTICAL
+        sha = _extract_hash(ra.stdout)
+        shb = _extract_hash(rb.stdout)
+        assert sha == shb, (
+            f"suite hash should NOT change with user_template: {sha} vs {shb}"
+        )
+        # Prompt-template hashes should differ
+        pta = _extract_prompt_template_hash(ra.stdout)
+        ptb = _extract_prompt_template_hash(rb.stdout)
+        assert pta and ptb, "prompt-template hashes must be nonempty"
+        assert pta != ptb, (
+            f"prompt-template hash should differ with user_template: {pta} == {ptb}"
+        )
+
+    def test_same_prompt_assembly_same_prompt_template_hash(self, tmp_path):
+        """Identical prompt assembly should yield identical prompt-template hashes
+        even when other suite fields differ."""
+        path_a = Path(tmp_path) / "a.json"
+        path_b = Path(tmp_path) / "b.json"
+        data_a = _minimal_suite()
+        data_b = _minimal_suite()
+        # Keep prompts identical, change expected_answer
+        data_b["cases"][0]["expected_answer"]["hidden_answer"] = "Berlin"
+        path_a.write_text(json.dumps(data_a), encoding="utf-8")
+        path_b.write_text(json.dumps(data_b), encoding="utf-8")
+        ra = _cli(["validate-suite", str(path_a)])
+        rb = _cli(["validate-suite", str(path_b)])
+        assert ra.returncode == 0
+        assert rb.returncode == 0
+        # Suite hashes differ (expected answer changed)
+        sha = _extract_hash(ra.stdout)
+        shb = _extract_hash(rb.stdout)
+        assert sha != shb
+        # Prompt-template hashes identical
+        pta = _extract_prompt_template_hash(ra.stdout)
+        ptb = _extract_prompt_template_hash(rb.stdout)
+        assert pta == ptb, (
+            f"prompt-template hash should not change with expected_answer: {pta} vs {ptb}"
+        )
+
+    def test_prompt_template_hash_present_in_stdout(self, tmp_path):
+        """The prompt-template hash is explicitly labeled in validate-suite output."""
+        path = _write_suite(_minimal_suite(), cwd=str(tmp_path))
+        result = _cli(["validate-suite", str(path)])
+        assert result.returncode == 0
+        pt_hash = _extract_prompt_template_hash(result.stdout)
+        assert pt_hash, "prompt-template hash should be present in stdout"
+        assert len(pt_hash) >= 32, "prompt-template hash should be a full SHA-256 hex"
 
 
 # ======================================================================

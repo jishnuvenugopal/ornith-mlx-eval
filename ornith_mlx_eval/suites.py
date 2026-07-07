@@ -280,21 +280,62 @@ def _normalise_text(text: str) -> str:
     return t
 
 
+def _normalise_json_escapes(text: str) -> str:
+    """Decode JSON escape sequences so that hidden answers encoded as
+    \\uXXXX or \\\" variants still trigger leakage detection (VAL-EVAL-033).
+
+    Handles the common escapes that could mask an answer:
+      * Unicode escapes:  \\u0050\\u0061...  ->  "Pa..."
+      * Quote escapes:    \\\"Paris\\\"        ->  "\"Paris\""
+      * Backslash:        \\\\                 ->  "\\"
+      * Control chars:    \\n \\t \\r
+    """
+    def _replace_unicode(m: re.Match[str]) -> str:
+        try:
+            return chr(int(m.group(1), 16))
+        except (ValueError, OverflowError):
+            return m.group(0)
+
+    result = re.sub(r'\\u([0-9a-fA-F]{4})', _replace_unicode, text)
+    result = result.replace('\\"', '"')
+    result = result.replace('\\\\', '\\')
+    result = result.replace('\\n', '\n')
+    result = result.replace('\\t', '\t')
+    result = result.replace('\\r', '\r')
+    return result
+
+
 def _answer_appears_in(text: str, answer: str) -> bool:
     """Check whether *answer* appears in *text* after normalisation.
 
     Uses word-boundary-aware matching to avoid substring false positives.
+    Additionally checks JSON-unescaped variants (VAL-EVAL-033) so that
+    \\uXXXX-encoded answers are still detected.
     """
     answer_norm = _normalise_text(answer)
-    text_norm = _normalise_text(text)
     if not answer_norm:
         return False
-    # Try word-boundary match first
+
     pattern = re.compile(r'\b' + re.escape(answer_norm) + r'\b')
-    if pattern.search(text_norm):
+
+    def _matches(t: str) -> bool:
+        if pattern.search(t):
+            return True
+        return answer_norm in t
+
+    # 1. Check normalised raw text
+    text_norm = _normalise_text(text)
+    if _matches(text_norm):
         return True
-    # Also check exact containment for edge cases (e.g. numeric answers)
-    return answer_norm in text_norm
+
+    # 2. Check JSON-unescaped version (handles \\uXXXX, \\\", etc.)
+    text_unescaped = _normalise_json_escapes(text)
+    if text_unescaped != text:
+        text_unescaped_norm = _normalise_text(text_unescaped)
+        if _matches(text_unescaped_norm):
+            return True
+
+    return False
 
 
 def _gather_visible_texts(suite: dict[str, Any]) -> list[tuple[str, str]]:
@@ -396,13 +437,15 @@ def _strip_ext(obj: dict[str, Any], semantic_keys: frozenset[str]) -> dict[str, 
 
 
 def _canonical_case(case: dict[str, Any]) -> dict[str, Any]:
-    """Build a canonical representation of a single case for hashing."""
+    """Build a canonical representation of a single case for suite hashing.
+
+    Prompt assembly fields (system, user_template) are deliberately excluded
+    from the suite hash (VAL-EVAL-007).  The prompt-template hash captures
+    those independently so that prompt changes do not invalidate suite identity.
+    """
     canon: dict[str, Any] = {}
     if "case_id" in case:
         canon["case_id"] = case["case_id"]
-    prompt = case.get("prompt", {})
-    if isinstance(prompt, dict):
-        canon["prompt"] = _strip_ext(prompt, SEMANTIC_PROMPT_FIELDS)
     ea = case.get("expected_answer", {})
     if isinstance(ea, dict):
         canon["expected_answer"] = _strip_ext(ea, SEMANTIC_EXPECTED_ANSWER_FIELDS)
