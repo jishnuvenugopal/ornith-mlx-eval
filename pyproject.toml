@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ornith-mlx-eval"
+version = "0.1.0"
+description = "Ornith MLX Evaluation Harness – evaluate Ornith MLX models locally on Apple Silicon"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Jishnu Venugopal" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "mlx==0.31.2",
+    "mlx-lm==0.31.3",
+    "transformers==5.0.0",
+    "huggingface_hub==1.22.0",
+    "numpy==2.5.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "jsonschema==4.26.0",
+]
+
+[project.scripts]
+ornith-mlx-eval = "ornith_mlx_eval.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ornith_mlx_eval*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
