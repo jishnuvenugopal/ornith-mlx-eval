@@ -1,0 +1,78 @@
+{
+  "suite_id": "smoke",
+  "suite_version": "0.1.0",
+  "description": "Smoke evaluation suite for the Ornith MLX evaluation harness. Covers basic fact retrieval, reasoning, numeric calculation, and simple code generation.",
+  "tags": ["smoke", "baseline"],
+  "cases": [
+    {
+      "case_id": "smoke-fact-001",
+      "prompt": {
+        "user_template": "What is the capital city of France? Answer with just the city name."
+      },
+      "expected_answer": {
+        "answer_type": "exact",
+        "hidden_answer": "Paris"
+      },
+      "grader": {
+        "type": "exact_match",
+        "options": { "ignore_case": true }
+      }
+    },
+    {
+      "case_id": "smoke-fact-002",
+      "prompt": {
+        "user_template": "What is the chemical symbol for water? Answer with just the formula."
+      },
+      "expected_answer": {
+        "answer_type": "exact",
+        "hidden_answer": "H2O"
+      },
+      "grader": {
+        "type": "exact_match",
+        "options": { "ignore_case": true, "strip_whitespace": true }
+      }
+    },
+    {
+      "case_id": "smoke-numeric-001",
+      "prompt": {
+        "user_template": "What is 15 multiplied by 7? Answer with just the number."
+      },
+      "expected_answer": {
+        "answer_type": "numeric",
+        "hidden_answer": "105"
+      },
+      "grader": {
+        "type": "numeric",
+        "options": { "tolerance": 0.01 }
+      }
+    },
+    {
+      "case_id": "smoke-reasoning-001",
+      "prompt": {
+        "user_template": "If it takes 4 people 6 hours to paint a fence, how many hours would it take 8 people to paint the same fence? Explain your reasoning step by step, then end your response with 'Answer: <number>'."
+      },
+      "expected_answer": {
+        "answer_type": "numeric",
+        "hidden_answer": "3"
+      },
+      "grader": {
+        "type": "numeric",
+        "options": { "tolerance": 0.5 }
+      }
+    },
+    {
+      "case_id": "smoke-code-001",
+      "prompt": {
+        "user_template": "Write a Python function called `double` that takes a number and returns twice its value. The function should be inside a fenced Python code block (```python ... ```)."
+      },
+      "expected_answer": {
+        "answer_type": "code",
+        "hidden_answer": "def double(x): return 2 * x"
+      },
+      "grader": {
+        "type": "code",
+        "options": { "test_input": 5, "expected_output": 10 }
+      }
+    }
+  ]
+}

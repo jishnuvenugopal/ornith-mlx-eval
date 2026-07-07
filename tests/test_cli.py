@@ -190,8 +190,8 @@ class TestExitCodes:
         [
             ["profile"],
             ["list-suites"],
-            # Commands that need positional args get a placeholder
-            ["validate-suite", "dummy.json"],
+            # validate-suite now does real work — use the smoke fixture
+            ["validate-suite", "suites/smoke.json"],
             ["smoke", "--model", "dummy-model"],
             ["run"],
             ["report", "dummy_dir"],

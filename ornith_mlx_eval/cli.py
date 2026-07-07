@@ -194,7 +194,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# ---- Command handlers (stubs for scaffold milestone) -----------------------
+# ---- Command handlers -------------------------------------------------------
 
 
 def _cmd_profile(args: argparse.Namespace) -> int:
@@ -204,14 +204,66 @@ def _cmd_profile(args: argparse.Namespace) -> int:
 
 
 def _cmd_list_suites(args: argparse.Namespace) -> int:
-    """list-suites – placeholder for milestone 2."""
-    print("list-suites: suite discovery (not yet implemented)", file=sys.stderr)
+    """list-suites – list discoverable public evaluation suites."""
+    from ornith_mlx_eval.suites import list_suites_info
+
+    suites = list_suites_info()
+    if not suites:
+        print("No suites discovered.", file=sys.stderr)
+        return 0
+
+    for info in suites:
+        status = "valid" if info.get("valid") else "INVALID"
+        sid = info.get("suite_id", "?")
+        count = info.get("case_count", 0)
+        desc = info.get("description", "")
+        hash_str = info.get("suite_hash", "")
+        print(f"{sid}  [{status}]  cases: {count}  hash: {hash_str}")
+        if desc:
+            print(f"  {desc}")
+        if info.get("errors"):
+            for err in info["errors"]:
+                print(f"    error: {err}")
     return 0
 
 
 def _cmd_validate_suite(args: argparse.Namespace) -> int:
-    """validate-suite – placeholder for milestone 2."""
-    print(f"validate-suite: {args.suite_path} (not yet implemented)", file=sys.stderr)
+    """validate-suite – validate a suite JSON file against the harness schema."""
+    from pathlib import Path
+
+    from ornith_mlx_eval.suites import (
+        SuiteValidationError,
+        compute_prompt_template_hash,
+        compute_suite_hash,
+        load_suite,
+        validate_suite,
+    )
+
+    path = Path(args.suite_path)
+    try:
+        suite = load_suite(path)
+    except SuiteValidationError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    errors = validate_suite(suite, suite_path=str(path))
+    if errors:
+        print(f"Suite '{path}' is INVALID:", file=sys.stderr)
+        for err in errors:
+            print(f"  - {err}", file=sys.stderr)
+        return 1
+
+    suite_hash = compute_suite_hash(suite)
+    prompt_hash = compute_prompt_template_hash(suite)
+    case_count = len(suite.get("cases", []))
+    suite_id = suite.get("suite_id", "?")
+
+    print(f"Suite: {suite_id}")
+    print(f"  Path: {path}")
+    print(f"  Status: valid")
+    print(f"  Cases: {case_count}")
+    print(f"  Suite hash: {suite_hash}")
+    print(f"  Prompt-template hash: {prompt_hash}")
     return 0
 
 
@@ -222,7 +274,33 @@ def _cmd_smoke(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    """run – placeholder for milestone 3."""
+    """run – placeholder for milestone 3 with suite revalidation."""
+    from pathlib import Path
+
+    if args.suite:
+        suite_path = Path(args.suite)
+        if suite_path.exists():
+            from ornith_mlx_eval.suites import (
+                SuiteValidationError,
+                load_suite,
+                validate_suite,
+            )
+            try:
+                suite = load_suite(suite_path)
+                errors = validate_suite(suite, suite_path=str(suite_path))
+                if errors:
+                    print(f"Suite validation failed for '{args.suite}':", file=sys.stderr)
+                    for err in errors:
+                        print(f"  - {err}", file=sys.stderr)
+                    return 1
+            except SuiteValidationError as exc:
+                print(f"Suite error: {exc}", file=sys.stderr)
+                return 1
+        else:
+            # Named suite (e.g. "smoke", "all") — not yet implemented
+            print(f"run: suite '{args.suite}' (suite lookup not yet implemented)", file=sys.stderr)
+            return 1
+
     print(
         f"run: runtime={args.runtime} suite={args.suite} (not yet implemented)",
         file=sys.stderr,
