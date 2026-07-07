@@ -22,8 +22,20 @@ import os
 import platform as _platform
 import shutil
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
+
+# ---------------------------------------------------------------------------
+# Optional imports (safe try/except for testability)
+# ---------------------------------------------------------------------------
+
+try:
+    from huggingface_hub import HfApi
+    from huggingface_hub.utils import RepositoryNotFoundError as HfRepoNotFoundError
+except ImportError:  # pragma: no cover — not reached with dev dependencies installed
+    HfApi = None  # type: ignore[assignment]
+    HfRepoNotFoundError = Exception  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -143,7 +155,14 @@ def check_mlx_packages() -> dict[str, Any]:
     try:
         import mlx
 
-        details["mlx_version"] = getattr(mlx, "__version__", "unknown")
+        mlx_ver = getattr(mlx, "__version__", None)
+        if mlx_ver is None:
+            # ``mlx`` does not expose ``__version__``; resolve via package metadata.
+            try:
+                mlx_ver = version("mlx")
+            except PackageNotFoundError:
+                mlx_ver = "unknown"
+        details["mlx_version"] = mlx_ver
     except ImportError:
         details["mlx_version"] = None
         failures.append(
@@ -155,7 +174,13 @@ def check_mlx_packages() -> dict[str, Any]:
     try:
         import mlx_lm
 
-        details["mlx_lm_version"] = getattr(mlx_lm, "__version__", "unknown")
+        mlx_lm_ver = getattr(mlx_lm, "__version__", None)
+        if mlx_lm_ver is None:
+            try:
+                mlx_lm_ver = version("mlx-lm")
+            except PackageNotFoundError:
+                mlx_lm_ver = "unknown"
+        details["mlx_lm_version"] = mlx_lm_ver
     except ImportError:
         details["mlx_lm_version"] = None
         failures.append(
@@ -465,10 +490,7 @@ def resolve_model_metadata(model_id: str) -> dict[str, Any]:
         return _make_check("model", "fail", details, reason)
 
     # 2. Resolve via Hugging Face Hub (metadata only, no download)
-    try:
-        from huggingface_hub import HfApi
-        from huggingface_hub.utils import RepositoryNotFoundError
-    except ImportError:
+    if HfApi is None:
         return _make_check(
             "model",
             "fail",
@@ -479,7 +501,7 @@ def resolve_model_metadata(model_id: str) -> dict[str, Any]:
     api = HfApi()
     try:
         info = api.model_info(model_id, files_metadata=True)
-    except RepositoryNotFoundError:
+    except HfRepoNotFoundError:
         return _make_check(
             "model",
             "fail",

@@ -297,6 +297,36 @@ class TestProfileMlxPackages:
             assert "0.31.2" in str(result["details"])
             assert "0.31.3" in str(result["details"])
 
+    def test_mlx_version_falls_back_to_importlib_metadata(self, monkeypatch):
+        """When mlx lacks ``__version__``, fall back to importlib.metadata.version('mlx')."""
+        from ornith_mlx_eval.profile import check_mlx_packages
+
+        fake_mlx = types.ModuleType("mlx")
+        # Deliberately omit __version__ to trigger the fallback
+        fake_mlx.core = FakeMlxCore
+        fake_mlx_lm = types.ModuleType("mlx_lm")
+        fake_mlx_lm.__version__ = "0.31.3"
+
+        # Mock importlib.metadata.version for mlx to return the expected version
+        def _fake_metadata_version(pkg_name):
+            if pkg_name == "mlx":
+                return "0.31.2"
+            if pkg_name == "mlx-lm":
+                return "0.31.3"
+            return "0.0.0"
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {"mlx": fake_mlx, "mlx.core": FakeMlxCore, "mlx_lm": fake_mlx_lm},
+        ):
+            with unittest.mock.patch(
+                "importlib.metadata.version", side_effect=_fake_metadata_version
+            ):
+                result = check_mlx_packages()
+                assert result["status"] == "pass"
+                assert result["details"]["mlx_version"] == "0.31.2"
+                assert result["details"]["mlx_lm_version"] == "0.31.3"
+
 
 class TestProfileMetal:
     """VAL-MLX-003 – Profile requires MLX Metal availability."""
@@ -490,8 +520,8 @@ class TestProfileModelResolution:
 
     @pytest.fixture(autouse=True)
     def _patch_hf(self):
-        """Mock huggingface_hub.HfApi to avoid real network calls."""
-        self._hf_patch = unittest.mock.patch("huggingface_hub.HfApi")
+        """Mock ornith_mlx_eval.profile.HfApi to avoid real network calls."""
+        self._hf_patch = unittest.mock.patch("ornith_mlx_eval.profile.HfApi")
         mock_api_class = self._hf_patch.start()
         mock_api = mock_api_class.return_value
 
@@ -596,7 +626,7 @@ class TestProfileRunFull:
         """Mock all external dependencies for full profile runs."""
         self._tmp = tmp_path
         # Patch HF API
-        self._hf_patch = unittest.mock.patch("huggingface_hub.HfApi")
+        self._hf_patch = unittest.mock.patch("ornith_mlx_eval.profile.HfApi")
         mock_api_class = self._hf_patch.start()
         mock_api = mock_api_class.return_value
         mock_api.model_info.side_effect = lambda repo_id, **kw: _fake_model_info(repo_id)
