@@ -32,6 +32,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--model",
         help="Model ID for metadata resolution (no weights downloaded)",
     )
+    profile_p.add_argument(
+        "--output-root",
+        default="benchmark_results",
+        help="Output root directory for writability check (default: benchmark_results)",
+    )
 
     # ---- list-suites ------------------------------------------------------
     list_suites_p = subparsers.add_parser(
@@ -198,8 +203,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_profile(args: argparse.Namespace) -> int:
-    """profile – placeholder for milestone 2."""
-    print("profile: preflight checks (not yet implemented)", file=sys.stderr)
+    """profile – run preflight checks and report environment readiness."""
+    from ornith_mlx_eval.profile import format_profile_output, run_profile
+
+    result = run_profile(model_id=args.model, output_root=args.output_root)
+    output = format_profile_output(result)
+    print(output)
+
+    if result["status"] == "fail":
+        return 1
     return 0
 
 
