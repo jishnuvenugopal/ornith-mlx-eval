@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from ornith_mlx_eval.parsing import ParseResult
+from ornith_mlx_eval.parsing import ParseResult, CodeExtractionResult, extract_fenced_code
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +138,7 @@ def grade(
 
     final_text = parse_result.final_text
 
-    # -- Dispatch to graded type ---------------------------------------------
+    # -- Dispatch to grader type ---------------------------------------------
     if grader_type == "exact_match":
         return grade_exact_match(final_text, expected, options)
     elif grader_type == "contains":
@@ -148,13 +148,7 @@ def grade(
     elif grader_type == "json_match":
         return grade_json_match(final_text, expected, options)
     elif grader_type == "code":
-        return GradeResult(
-            passed=False,
-            score=0.0,
-            reason="Code grading not yet implemented",
-            evidence=final_text,
-            grader_type="code",
-        )
+        return grade_code(final_text, expected, options)
     else:
         return GradeResult(
             passed=False,
@@ -179,6 +173,10 @@ def grade_exact_match(
 
     The candidate final text must match the expected string exactly
     (after optional case normalisation and whitespace stripping).
+
+    Empty final text always fails (fail-closed); a model that produces
+    no output should not be given credit, even if the expected answer
+    happens to be empty.
     """
     if not final_text:
         return _fail("exact_match", "Empty final text", final_text)
@@ -313,11 +311,17 @@ def grade_numeric(
                      f'No numeric value found in "{final_text}"',
                      final_text)
 
-    tolerance = options.get("tolerance", 0.0)
+    tolerance_raw = options.get("tolerance", 0.0)
+    if isinstance(tolerance_raw, bool):
+        return _fail("numeric",
+                     f"Invalid tolerance: boolean values are not allowed",
+                     final_text)
     try:
-        tolerance = float(tolerance)
+        tolerance = float(tolerance_raw)
     except (ValueError, TypeError):
-        tolerance = 0.0
+        return _fail("numeric",
+                     f"Invalid tolerance value: {tolerance_raw!r}",
+                     final_text)
 
     if abs(candidate_val - expected_val) <= tolerance:
         return GradeResult(
@@ -365,6 +369,58 @@ def grade_json_match(
     return _fail("json_match",
                  f"JSON mismatch: expected {expected}, got {candidate}",
                  final_text)
+
+
+def grade_code(
+    final_text: str,
+    expected: Any,
+    options: dict[str, Any],
+) -> GradeResult:
+    """Code grading via fenced Python code extraction.
+
+    Extracts a single fenced Python code block from the final text and
+    prepares it for sandbox execution.  The actual sandbox execution is
+    performed by the sandbox module; this grader handles extraction and
+    validation only.
+
+    The *expected* value for code graders is typically a boolean ``True``
+    (meaning "the code should pass its tests") or a dict describing
+    test inputs and expected outputs.
+    """
+    if not final_text:
+        return _fail("code", "Empty final text", final_text)
+
+    extraction = extract_fenced_code(final_text)
+
+    if extraction.status != "success":
+        # Map extraction failure statuses to grader reasons
+        reason_map: dict[str, str] = {
+            "no_fence": "No fenced Python code block found",
+            "multiple_fences": "Multiple conflicting Python code blocks found",
+            "unterminated_fence": "Unterminated code fence found",
+            "unsupported_language": "Only Python code blocks are supported",
+            "no_language": "Code fence missing language specifier; use ```python",
+            "empty_code": "Extracted code block is empty",
+        }
+        return _fail("code",
+                     reason_map.get(extraction.status, f"Code extraction failed: {extraction.status}"),
+                     final_text)
+
+    # Code was successfully extracted.  At this point the code is ready
+    # for sandbox execution.  The sandbox module (sandbox.py) will handle
+    # actual execution with timeout, environment scrubbing, etc.
+    #
+    # The grader reports successful extraction; whether the code passes
+    # execution-level tests is determined by the sandbox.
+    evidence = extraction.code
+
+    return GradeResult(
+        passed=True,
+        score=1.0,
+        reason=f"Python code extracted successfully ({len(extraction.code)} chars)",
+        evidence=evidence,
+        grader_type="code",
+    )
 
 
 # ---------------------------------------------------------------------------

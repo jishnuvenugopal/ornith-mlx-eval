@@ -250,4 +250,165 @@ def _detect_truncation(text: str) -> bool:
     word_count = len(stripped.split())
     if word_count <= 2:
         return False
-    return True
+
+    # Check if the last word looks like an incomplete word fragment
+    # (e.g. "Fr" from "France", "The capital of Fr")
+    last_word = stripped.split()[-1].rstrip(".,;:!?()[]{}'\"")
+    if _looks_incomplete(last_word):
+        return True
+
+    # Check if the last word is a known truncation-indicating word
+    # (auxiliary verbs, prepositions, articles, conjunctions that
+    #  typically require a complement and are unlikely to end a complete
+    #  thought).  This avoids flagging complete statements like
+    #  "The capital is Paris" while still catching "The capital of France is".
+    if last_word.lower() in _TRUNCATION_TAIL_WORDS:
+        return True
+
+    # If the text has many words but no sentence ender AND the last word
+    # is not a truncation indicator, assume it's a valid terse answer.
+    # Only flag truly long texts (>8 words) without sentence enders
+    # as potentially truncated.
+    if word_count > 8:
+        return True
+
+    return False
+
+
+def _looks_incomplete(word: str) -> bool:
+    """Heuristic: does *word* look like an incomplete word fragment?
+
+    Returns True if the word is short (<=3 chars), contains no vowels,
+    or ends with a consonant fragment that is unlikely to be a complete
+    English word.
+    """
+    if not word:
+        return False
+    w = word.lower()
+    # Very short fragments that aren't common short words
+    if len(w) <= 2 and w not in _COMMON_SHORT_WORDS:
+        return True
+    # Words without any vowels are likely fragments (e.g. "Fr", "cnt")
+    if not any(ch in "aeiouy" for ch in w):
+        return True
+    return False
+
+
+# Common short English words that shouldn't be flagged as incomplete
+_COMMON_SHORT_WORDS: frozenset[str] = frozenset({
+    "a", "i", "is", "it", "am", "be", "do", "go", "he", "hi", "if",
+    "in", "me", "my", "no", "of", "on", "or", "so", "to", "up", "us",
+    "we", "as", "at", "by", "an", "oh", "ok", "ah", "ha",
+})
+
+
+# ---------------------------------------------------------------------------
+# Fenced-code extraction
+# ---------------------------------------------------------------------------
+
+
+# Words that, when appearing at the end of text, suggest truncation
+_TRUNCATION_TAIL_WORDS: frozenset[str] = frozenset({
+    "is", "are", "was", "were", "be", "been", "being",
+    "the", "a", "an",
+    "of", "in", "to", "for", "on", "at", "by", "with", "from",
+    "and", "or", "but", "if", "as", "so", "nor", "yet",
+    "that", "this", "these", "those", "which", "what",
+    "has", "have", "had", "will", "would", "shall", "should",
+    "can", "could", "may", "might", "must",
+    "not", "also", "then", "than", "about", "into", "over",
+    "such", "its", "it", "there",
+})
+
+# Supported code fence languages
+_SUPPORTED_CODE_LANGUAGES: frozenset[str] = frozenset({"python", "py"})
+
+
+@dataclass
+class CodeExtractionResult:
+    """Result of extracting a fenced code block from a response.
+
+    Attributes:
+        code: The extracted code text (empty on failure).
+        language: The declared fence language (empty on failure).
+        status: One of ``"success"``, ``"no_fence"``,
+            ``"multiple_fences"``, ``"unterminated_fence"``,
+            ``"unsupported_language"``, ``"no_language"``, or
+            ``"empty_code"``.
+        fence_start_line: 0-based line index where the opening fence
+            appears, or -1 on failure.
+    """
+
+    code: str = ""
+    language: str = ""
+    status: str = "no_fence"
+    fence_start_line: int = -1
+
+
+def extract_fenced_code(text: str) -> CodeExtractionResult:
+    """Extract a single fenced Python code block from *text*.
+
+    Rules (VAL-EVAL-015, VAL-EVAL-016):
+
+    * Only ``python`` or ``py`` language identifiers are supported.
+    * Exactly one code block must be present; multiple blocks fail.
+    * The fence must be properly closed (`` ``` ``).
+    * Empty or whitespace-only blocks fail.
+    * A missing language identifier fails as ``no_language``.
+
+    Args:
+        text: The response text (typically the final text from parsing).
+
+    Returns:
+        A :class:`CodeExtractionResult` describing the extraction outcome.
+    """
+    # Find all fenced code blocks: ```<lang>\n<code>\n```
+    # Pattern: ^```(?:python|py)?\s*$(.*?)^```\s*$  (multiline)
+    fence_pattern = re.compile(
+        r'^```([^\n]*)$(.*?)^```\s*$',
+        re.MULTILINE | re.DOTALL,
+    )
+
+    matches = list(fence_pattern.finditer(text))
+    if not matches:
+        return CodeExtractionResult(status="no_fence")
+
+    # Extract all python/py blocks
+    python_blocks: list[tuple[str, str, int]] = []  # (lang, code, start_line)
+
+    for m in matches:
+        lang_str = m.group(1).strip().lower()
+        code = m.group(2)
+
+        # Compute 0-based line index of the opening fence
+        start_line = text[:m.start()].count('\n')
+
+        if lang_str in _SUPPORTED_CODE_LANGUAGES:
+            python_blocks.append((lang_str, code, start_line))
+
+    if not python_blocks:
+        # Check if there were any fenced blocks at all
+        # If there were non-python fences, mark as unsupported_language
+        for m in matches:
+            lang_str = m.group(1).strip().lower()
+            if lang_str:
+                return CodeExtractionResult(status="unsupported_language")
+        # Fences without language
+        return CodeExtractionResult(status="no_language")
+
+    if len(python_blocks) > 1:
+        return CodeExtractionResult(status="multiple_fences")
+
+    lang, code, start_line = python_blocks[0]
+
+    # Check for empty code
+    stripped_code = code.strip()
+    if not stripped_code:
+        return CodeExtractionResult(status="empty_code")
+
+    return CodeExtractionResult(
+        code=stripped_code,
+        language=lang,
+        status="success",
+        fence_start_line=start_line,
+    )
