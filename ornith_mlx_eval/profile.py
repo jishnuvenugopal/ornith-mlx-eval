@@ -47,6 +47,12 @@ DISK_HEADROOM_BYTES: int = 12 * 1024**3  # 12 GiB
 MIN_MLX_VERSION = "0.31.2"
 MIN_MLX_LM_VERSION = "0.31.3"
 
+
+def _parse_version(v: str) -> tuple[int, ...]:
+    """Parse a dotted version string into a comparable integer tuple."""
+    parts = v.strip().split(".")
+    return tuple(int(p) for p in parts if p.isdigit())
+
 # Model scope: models whose ID includes these substrings are unsupported
 # in normal work.  Checked case-insensitively.
 UNSUPPORTED_MODEL_PATTERNS: list[str] = ["8bit", "35b"]
@@ -69,6 +75,17 @@ def _make_check(name: str, status: str, details: dict[str, Any], reason: str = "
     if reason:
         result["reason"] = reason
     return result
+
+
+def _is_valid_hex_sha(sha: str) -> bool:
+    """Return True when *sha* is a valid 40-character hex string."""
+    if len(sha) != 40:
+        return False
+    try:
+        int(sha, 16)
+        return True
+    except ValueError:
+        return False
 
 
 def _is_project_venv() -> bool:
@@ -136,17 +153,28 @@ def check_python() -> dict[str, Any]:
             "Please use Python 3.10+."
         )
 
+    if not in_venv:
+        failures.append(
+            "Python is not running from the project venv (expected: .venv/bin/python). "
+            "Please activate the project venv first."
+        )
+
     if failures:
         return _make_check("python", "fail", details, "; ".join(failures))
     return _make_check("python", "pass", details)
 
 
 def check_mlx_packages() -> dict[str, Any]:
-    """Check that ``mlx`` and ``mlx-lm`` are importable and report versions.
+    """Check that ``mlx`` and ``mlx-lm`` are importable and validate versions.
+
+    Both packages must be importable and meet minimum version requirements
+    (``mlx >= 0.31.2``, ``mlx-lm >= 0.31.3``).  When a package lacks a
+    ``__version__`` attribute the check falls back to
+    ``importlib.metadata.version``.
 
     Returns
     -------
-    dict with import status and version strings.
+    dict with import status, version strings, and minimum requirement metadata.
     """
     details: dict[str, Any] = {}
     failures: list[str] = []
@@ -163,6 +191,22 @@ def check_mlx_packages() -> dict[str, Any]:
             except PackageNotFoundError:
                 mlx_ver = "unknown"
         details["mlx_version"] = mlx_ver
+
+        # Validate version meets minimum
+        if isinstance(mlx_ver, str) and mlx_ver != "unknown":
+            try:
+                installed = _parse_version(mlx_ver)
+                minimum = _parse_version(MIN_MLX_VERSION)
+                if installed < minimum:
+                    failures.append(
+                        f"mlx {mlx_ver} is below minimum required version {MIN_MLX_VERSION}. "
+                        f"Install mlx=={MIN_MLX_VERSION}."
+                    )
+            except (ValueError, IndexError):
+                failures.append(
+                    f"Cannot parse mlx version '{mlx_ver}'. "
+                    f"Expected version >= {MIN_MLX_VERSION}."
+                )
     except ImportError:
         details["mlx_version"] = None
         failures.append(
@@ -181,12 +225,31 @@ def check_mlx_packages() -> dict[str, Any]:
             except PackageNotFoundError:
                 mlx_lm_ver = "unknown"
         details["mlx_lm_version"] = mlx_lm_ver
+
+        # Validate version meets minimum
+        if isinstance(mlx_lm_ver, str) and mlx_lm_ver != "unknown":
+            try:
+                installed = _parse_version(mlx_lm_ver)
+                minimum = _parse_version(MIN_MLX_LM_VERSION)
+                if installed < minimum:
+                    failures.append(
+                        f"mlx-lm {mlx_lm_ver} is below minimum required version {MIN_MLX_LM_VERSION}. "
+                        f"Install mlx-lm=={MIN_MLX_LM_VERSION}."
+                    )
+            except (ValueError, IndexError):
+                failures.append(
+                    f"Cannot parse mlx-lm version '{mlx_lm_ver}'. "
+                    f"Expected version >= {MIN_MLX_LM_VERSION}."
+                )
     except ImportError:
         details["mlx_lm_version"] = None
         failures.append(
             "Package 'mlx-lm' is not installed. Install it with: "
             "pip install mlx-lm==" + MIN_MLX_LM_VERSION
         )
+
+    details["mlx_min_version"] = MIN_MLX_VERSION
+    details["mlx_lm_min_version"] = MIN_MLX_LM_VERSION
 
     if failures:
         return _make_check("mlx_packages", "fail", details, "; ".join(failures))
@@ -328,20 +391,26 @@ def check_output_dir(output_root: str = DEFAULT_OUTPUT_ROOT) -> dict[str, Any]:
     return _make_check("output", "pass", details)
 
 
-def check_disk(model_size_bytes: int = 0) -> dict[str, Any]:
+def check_disk(model_size_bytes: int = 0, target: str | None = None) -> dict[str, Any]:
     """Check free disk space against model size + headroom.
+
+    Measures free space at the HF cache / download target (the directory
+    where Hugging Face models are cached) so the free-space check reflects
+    the filesystem that will actually hold downloaded weights.
 
     Parameters
     ----------
     model_size_bytes: Expected model LFS size in bytes.  When 0, only
         a general check is performed.
+    target: Directory path to measure free space at.  Defaults to the
+        HF cache path (``HF_HOME`` or ``~/.cache/huggingface``).
 
     Returns
     -------
     Check result with free bytes, model size, headroom, and required bytes.
     """
-    # Use the repo root as the target disk for measurement.
-    target = str(_REPO_ROOT)
+    if target is None:
+        target = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 
     try:
         usage = shutil.disk_usage(target)
@@ -534,7 +603,7 @@ def resolve_model_metadata(model_id: str) -> dict[str, Any]:
 
     # 4. Extract SHA and compute LFS size
     sha: str = getattr(info, "sha", "") or ""
-    if not sha or len(sha) != 40:
+    if not sha or len(sha) != 40 or not _is_valid_hex_sha(sha):
         return _make_check(
             "model",
             "fail",

@@ -225,6 +225,22 @@ class TestProfilePythonRuntime:
         assert result["status"] == "pass"
         assert result["details"].get("in_venv") is True or ".venv" in result["details"].get("executable", "")
 
+    def test_non_venv_fails(self, monkeypatch, tmp_path):
+        """VAL-MLX-001 – Python outside the project venv fails the profile check."""
+        from ornith_mlx_eval.profile import check_python
+
+        # Simulate running from a non-venv python (e.g. a system python outside .venv)
+        fake_exe = str(tmp_path / "bin" / "python3.12")
+        monkeypatch.setattr(platform, "machine", lambda: "arm64")
+        monkeypatch.setattr(sys, "executable", fake_exe)
+        monkeypatch.setattr(sys, "prefix", str(tmp_path))  # Not under .venv
+        monkeypatch.setattr(sys, "version_info", (3, 12, 12, "final", 0))
+
+        result = check_python()
+        assert result["status"] == "fail"
+        assert "venv" in result["reason"].lower() or "project" in result["reason"].lower()
+        assert result["details"].get("in_venv") is False
+
 
 class TestProfileMlxPackages:
     """VAL-MLX-002 – Profile validates required MLX package stack."""
@@ -297,8 +313,13 @@ class TestProfileMlxPackages:
             assert "0.31.2" in str(result["details"])
             assert "0.31.3" in str(result["details"])
 
-    def test_mlx_version_falls_back_to_importlib_metadata(self, monkeypatch):
-        """When mlx lacks ``__version__``, fall back to importlib.metadata.version('mlx')."""
+    def test_mlx_version_falls_back_to_importlib_metadata(self):
+        """When mlx lacks ``__version__``, fall back to importlib.metadata.version('mlx').
+
+        Patches the **bound reference** ``ornith_mlx_eval.profile.version``
+        because the module imports ``version`` via ``from importlib.metadata
+        import version``.
+        """
         from ornith_mlx_eval.profile import check_mlx_packages
 
         fake_mlx = types.ModuleType("mlx")
@@ -307,7 +328,6 @@ class TestProfileMlxPackages:
         fake_mlx_lm = types.ModuleType("mlx_lm")
         fake_mlx_lm.__version__ = "0.31.3"
 
-        # Mock importlib.metadata.version for mlx to return the expected version
         def _fake_metadata_version(pkg_name):
             if pkg_name == "mlx":
                 return "0.31.2"
@@ -319,13 +339,87 @@ class TestProfileMlxPackages:
             sys.modules,
             {"mlx": fake_mlx, "mlx.core": FakeMlxCore, "mlx_lm": fake_mlx_lm},
         ):
+            # Patch at the bound reference (profile.version), not importlib.metadata.version
             with unittest.mock.patch(
-                "importlib.metadata.version", side_effect=_fake_metadata_version
+                "ornith_mlx_eval.profile.version", side_effect=_fake_metadata_version
             ):
                 result = check_mlx_packages()
                 assert result["status"] == "pass"
                 assert result["details"]["mlx_version"] == "0.31.2"
                 assert result["details"]["mlx_lm_version"] == "0.31.3"
+
+    def test_mlx_version_below_minimum_fails(self):
+        """mlx below minimum required version fails the check."""
+        from ornith_mlx_eval.profile import check_mlx_packages
+
+        fake_mlx = types.ModuleType("mlx")
+        fake_mlx.__version__ = "0.30.0"
+        fake_mlx.core = FakeMlxCore
+        fake_mlx_lm = types.ModuleType("mlx_lm")
+        fake_mlx_lm.__version__ = "0.31.3"
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {"mlx": fake_mlx, "mlx.core": FakeMlxCore, "mlx_lm": fake_mlx_lm},
+        ):
+            result = check_mlx_packages()
+            assert result["status"] == "fail"
+            assert "mlx" in result["reason"].lower()
+            assert "0.30.0" in result["reason"] or "0.31.2" in result["reason"]
+
+    def test_mlx_lm_version_below_minimum_fails(self):
+        """mlx-lm below minimum required version fails the check."""
+        from ornith_mlx_eval.profile import check_mlx_packages
+
+        fake_mlx = types.ModuleType("mlx")
+        fake_mlx.__version__ = "0.31.2"
+        fake_mlx.core = FakeMlxCore
+        fake_mlx_lm = types.ModuleType("mlx_lm")
+        fake_mlx_lm.__version__ = "0.30.0"
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {"mlx": fake_mlx, "mlx.core": FakeMlxCore, "mlx_lm": fake_mlx_lm},
+        ):
+            result = check_mlx_packages()
+            assert result["status"] == "fail"
+            assert "mlx-lm" in result["reason"].lower() or "0.30.0" in result["reason"]
+
+    def test_mlx_packages_reports_minimum_versions(self):
+        """Successful check records minimum required versions."""
+        from ornith_mlx_eval.profile import check_mlx_packages
+
+        fake_mlx = types.ModuleType("mlx")
+        fake_mlx.__version__ = "0.31.2"
+        fake_mlx.core = FakeMlxCore
+        fake_mlx_lm = types.ModuleType("mlx_lm")
+        fake_mlx_lm.__version__ = "0.31.3"
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {"mlx": fake_mlx, "mlx.core": FakeMlxCore, "mlx_lm": fake_mlx_lm},
+        ):
+            result = check_mlx_packages()
+            assert result["status"] == "pass"
+            assert result["details"].get("mlx_min_version") == "0.31.2"
+            assert result["details"].get("mlx_lm_min_version") == "0.31.3"
+
+    def test_mlx_newer_version_meets_minimum(self):
+        """mlx version newer than minimum passes the check."""
+        from ornith_mlx_eval.profile import check_mlx_packages
+
+        fake_mlx = types.ModuleType("mlx")
+        fake_mlx.__version__ = "0.32.0"
+        fake_mlx.core = FakeMlxCore
+        fake_mlx_lm = types.ModuleType("mlx_lm")
+        fake_mlx_lm.__version__ = "0.31.3"
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {"mlx": fake_mlx, "mlx.core": FakeMlxCore, "mlx_lm": fake_mlx_lm},
+        ):
+            result = check_mlx_packages()
+            assert result["status"] == "pass"
 
 
 class TestProfileMetal:
@@ -501,6 +595,53 @@ class TestProfileDisk:
         # Should pass or fail depending on policy, but at minimum reports free space
         assert "free_bytes" in result["details"]
 
+    def test_disk_measures_at_hf_cache_target(self, monkeypatch, tmp_path):
+        """Disk check measures free space at the HF cache / download target."""
+        from ornith_mlx_eval.profile import check_disk
+
+        cache_dir = tmp_path / "hf_cache"
+        cache_dir.mkdir()
+
+        captured_targets: list[str] = []
+
+        def _fake_disk_usage(p: str) -> unittest.mock.MagicMock:
+            captured_targets.append(str(p))
+            mock = unittest.mock.MagicMock()
+            mock.free = 100 * 1024**3
+            return mock
+
+        monkeypatch.setattr("shutil.disk_usage", _fake_disk_usage)
+        monkeypatch.setenv("HF_HOME", str(cache_dir))
+
+        result = check_disk(model_size_bytes=5 * 1024**3)
+        assert result["status"] == "pass"
+        assert len(captured_targets) == 1
+        assert str(cache_dir) in captured_targets[0]
+        assert "target" in result["details"]
+        assert str(cache_dir) in result["details"]["target"]
+
+    def test_disk_explicit_target_overrides_hf_cache(self, monkeypatch, tmp_path):
+        """When an explicit target is given, it overrides the HF cache default."""
+        from ornith_mlx_eval.profile import check_disk
+
+        explicit_target = tmp_path / "explicit"
+
+        captured_targets: list[str] = []
+
+        def _fake_disk_usage(p: str) -> unittest.mock.MagicMock:
+            captured_targets.append(str(p))
+            mock = unittest.mock.MagicMock()
+            mock.free = 100 * 1024**3
+            return mock
+
+        monkeypatch.setattr("shutil.disk_usage", _fake_disk_usage)
+        monkeypatch.setenv("HF_HOME", str(tmp_path / "ignored_cache"))
+
+        result = check_disk(model_size_bytes=5 * 1024**3, target=str(explicit_target))
+        assert result["status"] == "pass"
+        assert len(captured_targets) == 1
+        assert str(explicit_target) in captured_targets[0]
+
 
 class TestProfileMemory:
     """Memory/swap check."""
@@ -616,6 +757,64 @@ class TestProfileModelResolution:
         mock_api = self._hf_patch.get_original()[1]  # not ideal, let's just verify
         # Actually, just check no LFS files were downloaded
         assert result["details"]["size_bytes"] > 0
+
+    def test_malformed_sha_rejected(self):
+        """SHA that is not a 40-character hex string is rejected."""
+        from ornith_mlx_eval.profile import resolve_model_metadata
+
+        # Simulate a model whose info returns a malformed SHA
+        with unittest.mock.patch("ornith_mlx_eval.profile.HfApi") as mock_api_class:
+            mock_api = mock_api_class.return_value
+            fake_info = unittest.mock.MagicMock()
+            fake_info.sha = "not-a-valid-40-char-sha"
+            fake_info.siblings = []
+            fake_info.private = False
+            fake_info.gated = False
+            fake_info.tags = []
+            mock_api.model_info.return_value = fake_info
+
+            result = resolve_model_metadata("some-org/some-model")
+            assert result["status"] == "fail"
+            assert "sha" in result["reason"].lower() or "revision" in result["reason"].lower()
+
+    def test_non_hex_sha_rejected(self):
+        """SHA that is 40 chars but contains non-hex characters is rejected."""
+        from ornith_mlx_eval.profile import resolve_model_metadata
+
+        with unittest.mock.patch("ornith_mlx_eval.profile.HfApi") as mock_api_class:
+            mock_api = mock_api_class.return_value
+            fake_info = unittest.mock.MagicMock()
+            # 40 characters but contains 'g' and 'z' which are not hex
+            fake_info.sha = "ggggggggggggggggggggggggggggggggggggzzzz"
+            fake_info.siblings = []
+            fake_info.private = False
+            fake_info.gated = False
+            fake_info.tags = []
+            mock_api.model_info.return_value = fake_info
+
+            result = resolve_model_metadata("some-org/some-model")
+            assert result["status"] == "fail"
+            assert "sha" in result["reason"].lower() or "revision" in result["reason"].lower()
+
+    def test_valid_hex_sha_accepted(self):
+        """A valid 40-character hex SHA is accepted."""
+        from ornith_mlx_eval.profile import resolve_model_metadata
+
+        with unittest.mock.patch("ornith_mlx_eval.profile.HfApi") as mock_api_class:
+            mock_api = mock_api_class.return_value
+            fake_info = unittest.mock.MagicMock()
+            fake_info.sha = "1e980b9742a9e554a4d57e90b4c597811fb2fc4e"
+            fake_info.siblings = [
+                unittest.mock.MagicMock(rfilename="model.safetensors", size=5_000_000)
+            ]
+            fake_info.private = False
+            fake_info.gated = False
+            fake_info.tags = []
+            mock_api.model_info.return_value = fake_info
+
+            result = resolve_model_metadata("some-org/some-model")
+            assert result["status"] == "pass"
+            assert result["details"]["sha"] == "1e980b9742a9e554a4d57e90b4c597811fb2fc4e"
 
 
 class TestProfileRunFull:
