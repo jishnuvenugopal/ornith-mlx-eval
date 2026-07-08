@@ -286,52 +286,68 @@ def _cmd_smoke(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    """run – placeholder for milestone 3 with suite revalidation."""
-    from pathlib import Path
+    """run – execute a no-download mock evaluation and write artifacts."""
+    from ornith_mlx_eval.results import ResultArtifactError
+    from ornith_mlx_eval.runner import RunOptions, run_evaluation
 
-    if args.suite:
-        suite_path = Path(args.suite)
-        if suite_path.exists():
-            from ornith_mlx_eval.suites import (
-                SuiteValidationError,
-                load_suite,
-                validate_suite,
+    try:
+        run_dir = run_evaluation(
+            RunOptions(
+                runtime=args.runtime,
+                suite=args.suite,
+                model=args.model,
+                output_root=args.output_root,
+                limit=args.limit,
+                seed=args.seed,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                max_tokens=args.max_tokens,
+                max_prompt_tokens=args.max_prompt_tokens,
+                max_kv_size=args.max_kv_size,
             )
-            try:
-                suite = load_suite(suite_path)
-                errors = validate_suite(suite, suite_path=str(suite_path))
-                if errors:
-                    print(f"Suite validation failed for '{args.suite}':", file=sys.stderr)
-                    for err in errors:
-                        print(f"  - {err}", file=sys.stderr)
-                    return 1
-            except SuiteValidationError as exc:
-                print(f"Suite error: {exc}", file=sys.stderr)
-                return 1
-        else:
-            # Named suite (e.g. "smoke", "all") — not yet implemented
-            print(f"run: suite '{args.suite}' (suite lookup not yet implemented)", file=sys.stderr)
-            return 1
-
-    print(
-        f"run: runtime={args.runtime} suite={args.suite} (not yet implemented)",
-        file=sys.stderr,
-    )
+        )
+    except ResultArtifactError as exc:
+        print(f"run failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"Run directory: {run_dir}")
     return 0
 
 
 def _cmd_report(args: argparse.Namespace) -> int:
-    """report – placeholder for milestone 3."""
-    print(f"report: {args.run_dir} (not yet implemented)", file=sys.stderr)
+    """report – regenerate report.md from persisted run artifacts."""
+    from pathlib import Path
+
+    from ornith_mlx_eval.reporting import regenerate_report
+    from ornith_mlx_eval.results import ResultArtifactError
+
+    try:
+        output = regenerate_report(Path(args.run_dir))
+    except ResultArtifactError as exc:
+        print(f"report failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"Report written: {output}")
     return 0
 
 
 def _cmd_compare(args: argparse.Namespace) -> int:
-    """compare – placeholder for milestone 3."""
-    print(
-        f"compare: {args.run_a} vs {args.run_b} (not yet implemented)",
-        file=sys.stderr,
-    )
+    """compare – compare two persisted run directories."""
+    from pathlib import Path
+
+    from ornith_mlx_eval.reporting import compare_runs
+    from ornith_mlx_eval.results import ResultArtifactError
+
+    try:
+        output = compare_runs(
+            Path(args.run_a),
+            Path(args.run_b),
+            output=Path(args.output) if args.output else None,
+            allow_mismatch=args.allow_mismatch,
+        )
+    except ResultArtifactError as exc:
+        print(f"compare failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"Compare written: {output}")
     return 0
 
 

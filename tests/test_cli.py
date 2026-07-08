@@ -193,14 +193,15 @@ class TestExitCodes:
             # validate-suite now does real work — use the smoke fixture
             ["validate-suite", "suites/smoke.json"],
             ["smoke", "--model", "dummy-model"],
-            ["run"],
-            ["report", "dummy_dir"],
-            ["compare", "dummy_a", "dummy_b"],
         ],
     )
     def test_known_command_exits_zero(self, args):
         result = _cli(args)
         assert result.returncode == 0, f"'{' '.join(args)}' exit {result.returncode}"
+
+    def test_known_run_command_exits_zero(self, tmp_path):
+        result = _cli(["run", "--output-root", str(tmp_path / "runs")])
+        assert result.returncode == 0
 
     def test_invalid_command_exits_nonzero(self):
         assert _cli(["bad"]).returncode != 0
@@ -210,6 +211,14 @@ class TestExitCodes:
 
     def test_missing_required_args_exits_nonzero_validate_suite(self):
         assert _cli(["validate-suite"]).returncode != 0
+
+    def test_report_bad_input_exits_nonzero(self):
+        result = _cli(["report", "dummy_dir"])
+        assert result.returncode != 0
+
+    def test_compare_bad_inputs_exit_nonzero(self):
+        result = _cli(["compare", "dummy_a", "dummy_b"])
+        assert result.returncode != 0
 
 
 # ---------------------------------------------------------------------------
