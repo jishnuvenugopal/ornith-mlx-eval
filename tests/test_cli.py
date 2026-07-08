@@ -192,7 +192,6 @@ class TestExitCodes:
             ["list-suites"],
             # validate-suite now does real work — use the smoke fixture
             ["validate-suite", "suites/smoke.json"],
-            ["smoke", "--model", "dummy-model"],
         ],
     )
     def test_known_command_exits_zero(self, args):
@@ -218,6 +217,10 @@ class TestExitCodes:
 
     def test_compare_bad_inputs_exit_nonzero(self):
         result = _cli(["compare", "dummy_a", "dummy_b"])
+        assert result.returncode != 0
+
+    def test_smoke_without_real_model_opt_in_exits_nonzero(self):
+        result = _cli(["smoke", "--model", "dummy-model"])
         assert result.returncode != 0
 
 

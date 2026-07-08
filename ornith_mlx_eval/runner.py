@@ -19,6 +19,12 @@ from typing import Any
 
 from ornith_mlx_eval import __version__
 from ornith_mlx_eval.graders import grade
+from ornith_mlx_eval.mlx_session import (
+    MlxGenerationOptions,
+    MlxSessionError,
+    SUPPORTED_MODEL_SHAS,
+    generate_with_mlx,
+)
 from ornith_mlx_eval.parsing import parse_response
 from ornith_mlx_eval.reporting import render_report
 from ornith_mlx_eval.results import (
@@ -60,14 +66,17 @@ class RunOptions:
     max_tokens: int | None = None
     max_prompt_tokens: int | None = None
     max_kv_size: int | None = None
+    allow_download: bool = False
 
 
 def run_evaluation(options: RunOptions) -> Path:
     """Run an evaluation and return the completed run directory."""
     if options.limit is not None and options.limit <= 0:
         raise ResultArtifactError("--limit must be a positive integer")
-    if options.runtime != "mock":
-        raise ResultArtifactError("Only --runtime mock is available until the MLX runtime milestone")
+    if options.runtime not in {"mock", "mlx"}:
+        raise ResultArtifactError(f"Unsupported runtime: {options.runtime}")
+    if options.runtime == "mlx":
+        _gate_mlx_run(options)
 
     suite, suite_path = _load_selected_suite(options.suite)
     errors = validate_suite(suite, suite_path=str(suite_path) if suite_path else "")
@@ -88,7 +97,10 @@ def run_evaluation(options: RunOptions) -> Path:
 
     try:
         manifest = _build_manifest(options, suite, selected_cases, run_dir, run_id)
-        rows = _run_mock_cases(manifest, selected_cases)
+        if options.runtime == "mock":
+            rows = _run_mock_cases(manifest, selected_cases)
+        else:
+            rows = _run_mlx_cases(manifest, selected_cases, options)
         classification = manifest["classification"]
         summary = summarize_rows(run_id, rows, classification=classification, limit=options.limit)
 
@@ -223,16 +235,16 @@ def _build_manifest(
             "git_dirty": _git_dirty(),
         },
         "runtime": {
-            "kind": "mock",
-            "resource_status": "not-measured",
+            "kind": options.runtime,
+            "resource_status": "not-measured" if options.runtime == "mock" else "measured",
         },
         "model": {
             "repo_id": model_id,
-            "revision": MOCK_REVISION,
-            "quantization": "mock",
-            "variant": "mock",
-            "tokenizer_identity": "mock-tokenizer-v1",
-            "chat_template_identity": "mock-chat-template-v1",
+            "revision": _model_revision(options.runtime, model_id),
+            "quantization": _model_quantization(options.runtime, model_id),
+            "variant": _model_variant(options.runtime, model_id),
+            "tokenizer_identity": "mock-tokenizer-v1" if options.runtime == "mock" else f"{model_id}:tokenizer",
+            "chat_template_identity": "mock-chat-template-v1" if options.runtime == "mock" else f"{model_id}:chat-template",
         },
         "suite": {
             "suite_id": suite.get("suite_id", "unknown"),
@@ -315,6 +327,94 @@ def _run_mock_cases(manifest: dict[str, Any], cases: list[dict[str, Any]]) -> li
     return rows
 
 
+def _run_mlx_cases(
+    manifest: dict[str, Any],
+    cases: list[dict[str, Any]],
+    options: RunOptions,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    revision = manifest["model"]["revision"]
+    model_id = manifest["model"]["repo_id"]
+    gen_options = MlxGenerationOptions(
+        max_tokens=manifest["settings"]["decoding"]["max_tokens"],
+        temperature=manifest["settings"]["decoding"]["temperature"],
+        top_p=manifest["settings"]["decoding"]["top_p"],
+        top_k=manifest["settings"]["decoding"]["top_k"],
+        seed=manifest["settings"]["seed"],
+        max_prompt_tokens=manifest["settings"]["decoding"]["max_prompt_tokens"],
+        max_kv_size=manifest["settings"]["decoding"]["max_kv_size"],
+    )
+    for index, case in enumerate(cases):
+        try:
+            generation = generate_with_mlx(
+                model_id,
+                revision,
+                render_prompt(case),
+                gen_options,
+            )
+            raw_response = generation.raw_text
+            prompt_tokens = generation.prompt_tokens
+            generated_tokens = generation.generated_tokens
+            peak_memory = generation.peak_mlx_memory_bytes
+            case_errors: list[dict[str, str]] = []
+        except MlxSessionError as exc:
+            raw_response = ""
+            prompt_tokens = len(render_prompt(case).split())
+            generated_tokens = 0
+            peak_memory = 0
+            case_errors = [{"type": "runtime_error", "message": str(exc)}]
+
+        parsed = parse_response(raw_response)
+        grader = case.get("grader", {})
+        expected = _expected_value(case)
+        grade_result = grade(parsed, expected, grader.get("type"), _grader_options(grader))
+        if not grade_result.passed:
+            case_errors.append({"type": "case_failure", "message": grade_result.reason})
+
+        rows.append({
+            "schema_version": SCHEMA_VERSION,
+            "run_id": manifest["run_id"],
+            "case_id": str(case.get("case_id", f"case-{index}")),
+            "case_index": index,
+            "scored": True,
+            "category": "smoke",
+            "prompt_hash": compute_case_prompt_hash(case),
+            "prompt_chars": len(render_prompt(case)),
+            "raw_response": raw_response,
+            "parse": {
+                "status": parsed.parse_status,
+                "is_truncated": parsed.is_truncated,
+                "reasoning_text": parsed.reasoning_text,
+                "final_text": parsed.final_text,
+            },
+            "grade": {
+                "passed": bool(grade_result.passed),
+                "score": float(grade_result.score),
+                "reason": grade_result.reason,
+                "grader_type": grade_result.grader_type,
+                "evidence": grade_result.evidence,
+            },
+            "timing": {
+                "wall_seconds": 0.0,
+                "first_token_seconds": 0.0,
+                "decode_tokens_per_second": 0.0,
+            },
+            "tokens": {
+                "prompt": prompt_tokens,
+                "generated": generated_tokens,
+            },
+            "resources": {
+                "peak_mlx_memory_bytes": peak_memory,
+                "memory_pressure": "not-measured",
+                "swap_delta_bytes": 0,
+            },
+            "errors": case_errors,
+        })
+    if all(row["errors"] for row in rows):
+        raise ResultArtifactError("MLX runtime failed to produce any successful case result")
+    return rows
+
+
 def _mock_response(case: dict[str, Any]) -> str:
     grader = case.get("grader", {})
     gtype = grader.get("type")
@@ -353,6 +453,45 @@ def _normalise_option(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+def _gate_mlx_run(options: RunOptions) -> None:
+    if not options.model:
+        raise ResultArtifactError("--runtime mlx requires --model")
+    if "8bit" in options.model.lower() or "35b" in options.model.lower():
+        raise ResultArtifactError(f"Unsupported MLX model: {options.model}")
+    if options.model not in SUPPORTED_MODEL_SHAS:
+        raise ResultArtifactError(f"Unsupported MLX model: {options.model}")
+    if not options.allow_download or os.environ.get("ORNITH_MLX_ALLOW_MODEL_DOWNLOAD") != "1":
+        raise ResultArtifactError(
+            "MLX runtime requires explicit opt-in: pass --allow-download and set "
+            "ORNITH_MLX_ALLOW_MODEL_DOWNLOAD=1"
+        )
+
+
+def _model_revision(runtime: str, model_id: str) -> str:
+    if runtime == "mock":
+        return MOCK_REVISION
+    return SUPPORTED_MODEL_SHAS[model_id]
+
+
+def _model_quantization(runtime: str, model_id: str) -> str:
+    if runtime == "mock":
+        return "mock"
+    lower = model_id.lower()
+    if "6bit" in lower:
+        return "6bit"
+    if "4bit" in lower:
+        return "4bit"
+    return "unknown"
+
+
+def _model_variant(runtime: str, model_id: str) -> str:
+    if runtime == "mock":
+        return "mock"
+    if "9b" in model_id.lower():
+        return "9B"
+    return "unknown"
 
 
 def _git_commit() -> str:

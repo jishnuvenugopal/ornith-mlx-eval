@@ -95,6 +95,30 @@ def _build_parser() -> argparse.ArgumentParser:
         default="benchmark_results",
         help="Output root directory (default: benchmark_results)",
     )
+    smoke_p.add_argument(
+        "--max-prompt-tokens",
+        type=int,
+        default=8192,
+        help="Maximum prompt tokens before rejection (default: 8192)",
+    )
+    smoke_p.add_argument(
+        "--max-kv-size",
+        type=int,
+        default=4096,
+        help="Maximum KV cache size (default: 4096)",
+    )
+    smoke_p.add_argument(
+        "--allow-download",
+        action="store_true",
+        help=(
+            "Explicitly allow real model downloads when "
+            "ORNITH_MLX_ALLOW_MODEL_DOWNLOAD=1 is also set"
+        ),
+    )
+    smoke_p.add_argument(
+        "--promotion-source",
+        help="Path to a fresh 4bit smoke manifest required for 6bit promotion",
+    )
 
     # ---- run --------------------------------------------------------------
     run_p = subparsers.add_parser(
@@ -161,6 +185,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-kv-size",
         type=int,
         help="Maximum KV cache size",
+    )
+    run_p.add_argument(
+        "--allow-download",
+        action="store_true",
+        help=(
+            "Explicitly allow real model downloads for --runtime mlx when "
+            "ORNITH_MLX_ALLOW_MODEL_DOWNLOAD=1 is also set"
+        ),
     )
 
     # ---- report -----------------------------------------------------------
@@ -280,8 +312,30 @@ def _cmd_validate_suite(args: argparse.Namespace) -> int:
 
 
 def _cmd_smoke(args: argparse.Namespace) -> int:
-    """smoke – placeholder for milestone 4."""
-    print(f"smoke: model={args.model} (not yet implemented)", file=sys.stderr)
+    """smoke – run gated real MLX smoke only after explicit opt-in."""
+    from ornith_mlx_eval.mlx_session import MlxSessionError, run_real_smoke
+
+    try:
+        result = run_real_smoke(
+            args.model,
+            allow_download=args.allow_download,
+            promotion_source=args.promotion_source,
+            max_tokens=args.max_tokens,
+            seed=args.seed if args.seed is not None else 42,
+            temperature=args.temperature if args.temperature is not None else 0,
+            top_p=args.top_p if args.top_p is not None else 1,
+            top_k=args.top_k if args.top_k is not None else 0,
+            max_prompt_tokens=args.max_prompt_tokens,
+            max_kv_size=args.max_kv_size,
+        )
+    except MlxSessionError as exc:
+        print(f"smoke failed: {exc}", file=sys.stderr)
+        return 1
+    print("Smoke status: PASS")
+    print(f"Model: {result['model_id']}")
+    print(f"Revision: {result['revision']}")
+    print("Classification: smoke-only")
+    print(f"Generated tokens: {result['generated_tokens']}")
     return 0
 
 
@@ -305,6 +359,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 max_tokens=args.max_tokens,
                 max_prompt_tokens=args.max_prompt_tokens,
                 max_kv_size=args.max_kv_size,
+                allow_download=args.allow_download,
             )
         )
     except ResultArtifactError as exc:
