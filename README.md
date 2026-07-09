@@ -6,6 +6,78 @@ The default workflow is safe and no-download: it validates suites, runs the
 deterministic mock runtime, writes reproducible artifacts, regenerates reports,
 and compares persisted runs without loading model weights.
 
+Inspired by the practical local-eval presentation in
+[jikkuatwork/ornith-eval](https://github.com/jikkuatwork/ornith-eval), adapted
+for direct MLX usage instead of Ollama.
+
+The goal is not to publish a leaderboard score. It is to answer: can this local
+MLX harness safely run Ornith evals on this machine, produce reproducible
+artifacts, and make real model smoke tests explicit and resource-gated?
+
+## Executive Verdict
+
+This repository is ready as a public, local-first MLX evaluation harness.
+
+Highlights:
+
+- Default workflow is no-download and deterministic through the mock runtime.
+- Public smoke suite has `5` authored cases and validates with stable hashes.
+- Completed runs produce `manifest.json`, `results.jsonl`, `summary.json`, and
+  `report.md` in isolated run directories.
+- Reports and comparisons are regenerated from persisted artifacts only.
+- Real MLX smoke is available but explicitly gated to avoid accidental GiB-scale
+  downloads or unsafe memory pressure.
+- 8bit and 35B variants are rejected for normal local work on the target 16 GB
+  Apple Silicon machine.
+- Public clean-clone verification passed before this presentation refresh.
+
+## Target Model And Environment
+
+| Dimension | Value |
+|---|---|
+| Runtime | Direct MLX / MLX-LM |
+| Default run mode | `mock`, no model download |
+| First real smoke target | `mlx-community/Ornith-1.0-9B-4bit` |
+| Promotion target | `mlx-community/Ornith-1.0-9B-6bit` |
+| 4bit pinned revision | `1e980b9742a9e554a4d57e90b4c597811fb2fc4e` |
+| 6bit pinned revision | `a2800933352a607ffbb1f814295fc3ff8e10ad69` |
+| Rejected normal-local variants | 9B 8bit and 35B variants |
+| Target hardware | Apple Silicon Mac with 16 GB unified memory |
+| Python | 3.10+, verified with Python 3.12 |
+| Package status | Public clean-clone install and test gate passed |
+
+## Current Public Results
+
+These are harness-readiness results, not model-quality benchmark scores. Real
+model results are intentionally generated locally and kept out of git unless
+the user opts into a smoke run.
+
+| Check | Result |
+|---|---:|
+| Full local test gate | `519 passed` |
+| Clean-clone test gate | `519 passed` |
+| CLI help | passed |
+| `pip check` | clean |
+| Public smoke suite | valid, `5` cases |
+| Mock run/report/compare workflow | passed |
+| Private/generated path audit | no tracked private paths |
+| README presentation refresh | local full gate passed |
+
+## Reports And Artifacts
+
+Generated reports are local outputs, not committed benchmark data.
+
+| Artifact | Description |
+|---|---|
+| `manifest.json` | Run identity, suite/model/runtime metadata, settings, and environment. |
+| `results.jsonl` | Case-level parsed responses, grades, hashes, and resource fields. |
+| `summary.json` | Aggregate totals, pass rate, classification, and smoke-only flag. |
+| `report.md` | Human-readable Markdown report regenerated from persisted files. |
+| `compare_*.md` | Optional persisted-run comparison with invariant checks. |
+
+Raw generated outputs belong under `benchmark_results/`, which is intentionally
+ignored.
+
 ## Requirements
 
 - Apple Silicon Mac for real MLX runtime work.
