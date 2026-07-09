@@ -1,5 +1,8 @@
 plan.md
 status.md
+whatisdone.md
+whatisleft.md
+koder/
 
 .venv/
 __pycache__/
@@ -10,6 +13,13 @@ __pycache__/
 *.egg-info/
 
 benchmark_results/
+.factory/
+.cache/
+huggingface/
+hf_cache/
+model_cache/
+models/
+snapshots/
 *.log
 
 .DS_Store

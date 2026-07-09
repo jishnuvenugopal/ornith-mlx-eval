@@ -119,10 +119,12 @@ These files are planning/session artifacts and must stay unpublished:
 - `status.md`
 - `whatisdone.md`
 - `whatisleft.md`
+- `koder/`
 
 Generated outputs and caches are also excluded from git:
 
 - `benchmark_results/`
+- `.factory/`
 - `.venv/`
 - `.pytest_cache/`
 - `*.egg-info/`
