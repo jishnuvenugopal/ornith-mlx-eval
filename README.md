@@ -54,14 +54,45 @@ the user opts into a smoke run.
 
 | Check | Result |
 |---|---:|
-| Full local test gate | `519 passed` |
-| Clean-clone test gate | `519 passed` |
+| Test gate | `537 passed` |
 | CLI help | passed |
 | `pip check` | clean |
 | Public smoke suite | valid, `5` cases |
 | Mock run/report/compare workflow | passed |
 | Private/generated path audit | no tracked private paths |
 | README presentation refresh | local full gate passed |
+
+## Measured Local 4bit Smoke
+
+On July 18, 2026, the pinned 4bit model completed the gated one-case smoke on
+the target Apple M1 Pro system. These measurements are local smoke evidence,
+not a throughput benchmark or model-quality score.
+
+| Dimension | Measured value |
+|---|---:|
+| Status | `PASS`, exact-match answer `Paris` |
+| Model | `mlx-community/Ornith-1.0-9B-4bit` |
+| Revision | `1e980b9742a9e554a4d57e90b4c597811fb2fc4e` |
+| Host | Apple M1 Pro, `16 GiB` unified memory |
+| Runtime stack | `mlx 0.31.2`, `mlx-lm 0.31.3`, Python `3.12.12` |
+| Prompt / generated tokens | `27` / `2` |
+| Cold model load | `3.584 s` |
+| First token | `1.469 s` |
+| Total wall time | `5.145 s` |
+| Decode throughput | `67.78 tokens/s` (`2` generated tokens; smoke latency evidence, not throughput) |
+| Peak MLX memory | `5,238,594,264` bytes (`4.88 GiB`) |
+| Swap growth during canonical pass | `0` bytes |
+
+The canonical run used the model's pinned chat template with thinking disabled,
+temperature `0`, seed `42`, serial execution, and a `32`-token ceiling. Its
+generated run directory remains ignored and local-only.
+
+The first cold host attempt was safely stopped because swap grew by `3.96 GiB`,
+above the harness's `1 GiB` resource-stop threshold. After memory pressure
+recovered and instruction formatting was corrected, the canonical pass added
+no swap and post-process system memory recovered to `69%` free. This makes the
+4bit result credible but also shows why 6bit promotion remains a separate,
+resource-gated decision on a `16 GiB` machine.
 
 ## Reports And Artifacts
 
@@ -88,12 +119,15 @@ ignored.
 ## Setup
 
 ```bash
-/opt/homebrew/bin/python3.12 -m venv .venv
+python3.12 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
 .venv/bin/python -m pytest -q
 .venv/bin/ornith-mlx-eval --help
 .venv/bin/python -m pip check
 ```
+
+On Homebrew installations where `python3.12` is not on `PATH`, use
+`/opt/homebrew/bin/python3.12 -m venv .venv` for the first command.
 
 The package pins the verified local stack:
 
@@ -130,8 +164,9 @@ Successful runs create one isolated run directory with:
 - `report.md`
 
 `report` reads only persisted files and rewrites only `<run_dir>/report.md`.
-`compare` reads only persisted run directories and writes either the explicit
-`--output` path or the documented default compare Markdown path.
+`compare` reads only persisted run directories. It writes either the explicit
+`--output` path or, when both runs share a parent, the default comparison
+Markdown path beside them. Runs from different parents require `--output`.
 
 ## Real MLX Smoke
 
