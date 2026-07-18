@@ -89,8 +89,10 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         raise ResultArtifactError(
             f"Unsupported manifest schema_version: {manifest.get('schema_version')}"
         )
-    if manifest["status"] != "completed":
-        raise ResultArtifactError("Run is incomplete: manifest status is not 'completed'")
+    if manifest["status"] not in {"completed", "stopped"}:
+        raise ResultArtifactError("Run is incomplete: manifest status is neither 'completed' nor 'stopped'")
+    if manifest["status"] == "stopped" and manifest.get("runtime", {}).get("kind") != "mlx":
+        raise ResultArtifactError("Only MLX runs may use manifest status 'stopped'")
     _require_keys(manifest["suite"], ["suite_id", "suite_hash", "prompt_template_hash"], "manifest.suite")
     _require_keys(manifest["settings"], ["seed", "decoding", "prompt_order", "concurrency"], "manifest.settings")
     _require_keys(manifest["runtime"], ["kind"], "manifest.runtime")
@@ -119,6 +121,9 @@ def validate_result_row(row: dict[str, Any], index: int) -> None:
         raise ResultArtifactError(f"Unsupported row schema_version at row {index}")
     _require_keys(row["parse"], ["status", "is_truncated", "reasoning_text", "final_text"], f"row {index}.parse")
     _require_keys(row["grade"], ["passed", "score", "reason", "grader_type"], f"row {index}.grade")
+    _require_keys(row["timing"], ["wall_seconds", "first_token_seconds", "decode_tokens_per_second"], f"row {index}.timing")
+    _require_keys(row["tokens"], ["prompt", "generated"], f"row {index}.tokens")
+    _require_keys(row["resources"], ["peak_mlx_memory_bytes", "swap_delta_bytes"], f"row {index}.resources")
 
 
 def validate_summary(summary: dict[str, Any]) -> None:
@@ -138,8 +143,8 @@ def validate_summary(summary: dict[str, Any]) -> None:
         raise ResultArtifactError(
             f"Unsupported summary schema_version: {summary.get('schema_version')}"
         )
-    if summary["status"] != "completed":
-        raise ResultArtifactError("Run is incomplete: summary status is not 'completed'")
+    if summary["status"] not in {"completed", "stopped"}:
+        raise ResultArtifactError("Run is incomplete: summary status is neither 'completed' nor 'stopped'")
 
 
 def validate_artifact_set(manifest: dict[str, Any], rows: list[dict[str, Any]], summary: dict[str, Any]) -> None:
@@ -152,12 +157,144 @@ def validate_artifact_set(manifest: dict[str, Any], rows: list[dict[str, Any]], 
     validate_summary(summary)
     if summary["run_id"] != manifest["run_id"]:
         raise ResultArtifactError("summary.json run_id mismatch")
+    if summary["status"] != manifest["status"]:
+        raise ResultArtifactError("summary.json status does not match manifest.json")
     scored_rows = [row for row in rows if row.get("scored")]
     totals = summary["totals"]
-    if totals.get("scored") != len(scored_rows):
-        raise ResultArtifactError("summary totals.scored does not match results.jsonl")
-    if totals.get("passed") != sum(1 for row in scored_rows if row["grade"]["passed"]):
-        raise ResultArtifactError("summary totals.passed does not match results.jsonl")
+    passed = sum(1 for row in scored_rows if row["grade"]["passed"])
+    expected_totals = {
+        "rows": len(rows),
+        "scored": len(scored_rows),
+        "passed": passed,
+        "failed": len(scored_rows) - passed,
+        "skipped": 0,
+        "parse_failures": sum(
+            1 for row in scored_rows if row["parse"]["status"] != "success"
+        ),
+        "truncated": sum(
+            1 for row in scored_rows if row["parse"]["is_truncated"]
+        ),
+        "resource_stops": sum(
+            1
+            for row in rows
+            if any(
+                error.get("type") == "resource_stop"
+                for error in row.get("errors", [])
+            )
+        ),
+        "errors": sum(1 for row in scored_rows if row.get("errors")),
+    }
+    for key, expected in expected_totals.items():
+        if totals.get(key) != expected:
+            raise ResultArtifactError(
+                f"summary totals.{key} does not match results.jsonl"
+            )
+    expected_pass_rate = passed / len(scored_rows) if scored_rows else 0.0
+    expected_average = (
+        sum(float(row["grade"]["score"]) for row in scored_rows)
+        / len(scored_rows)
+        if scored_rows
+        else 0.0
+    )
+    if abs(float(summary["pass_rate"]) - expected_pass_rate) > 1e-12:
+        raise ResultArtifactError("summary pass_rate does not match results.jsonl")
+    if abs(float(summary["average_score"]) - expected_average) > 1e-12:
+        raise ResultArtifactError("summary average_score does not match results.jsonl")
+    if summary["classification"] != manifest["classification"]:
+        raise ResultArtifactError(
+            "summary classification does not match manifest.json"
+        )
+    if bool(summary["smoke_only"]) != (manifest["classification"] == "smoke-only"):
+        raise ResultArtifactError(
+            "summary smoke_only does not match manifest classification"
+        )
+    if manifest.get("runtime", {}).get("kind") == "mlx":
+        _validate_mlx_evidence(manifest, rows, summary)
+
+
+def _validate_mlx_evidence(
+    manifest: dict[str, Any],
+    rows: list[dict[str, Any]],
+    summary: dict[str, Any],
+) -> None:
+    runtime = manifest["runtime"]
+    if runtime.get("preflight_status") != "pass":
+        raise ResultArtifactError("Real MLX artifacts require a passing recorded preflight")
+    cache_status = runtime.get("cache_status", {}).get("status")
+    if cache_status not in {"hit-complete", "miss"}:
+        raise ResultArtifactError("Real MLX artifacts require a valid recorded cache status")
+    model = manifest["model"]
+    if len(str(model.get("revision", ""))) != 40 or int(model.get("size_bytes", 0) or 0) <= 0:
+        raise ResultArtifactError("Real MLX artifacts require exact model revision and size")
+
+    timing_keys = {
+        "cold_load_seconds",
+        "wall_seconds",
+        "first_token_seconds",
+        "decode_seconds",
+        "decode_tokens_per_second",
+        "prompt_tokens_per_second",
+    }
+    resource_keys = {
+        "peak_mlx_memory_bytes",
+        "disk_free_before_bytes",
+        "disk_free_after_bytes",
+        "memory_pressure_before",
+        "memory_pressure_after",
+        "swap_used_before_bytes",
+        "swap_used_after_bytes",
+        "swap_delta_bytes",
+        "resource_stop_reason",
+    }
+    for index, row in enumerate(rows):
+        missing_timing = sorted(timing_keys - set(row["timing"]))
+        missing_resources = sorted(resource_keys - set(row["resources"]))
+        if missing_timing:
+            raise ResultArtifactError(
+                f"Real MLX row {index} missing timing fields: {', '.join(missing_timing)}"
+            )
+        if missing_resources:
+            raise ResultArtifactError(
+                f"Real MLX row {index} missing resource fields: {', '.join(missing_resources)}"
+            )
+        if float(row["timing"]["wall_seconds"] or 0) <= 0:
+            raise ResultArtifactError(f"Real MLX row {index} has invalid wall timing")
+        if int(row["tokens"]["prompt"] or 0) <= 0 or int(row["tokens"]["generated"] or 0) <= 0:
+            raise ResultArtifactError(f"Real MLX row {index} has invalid token counts")
+        if float(row["timing"]["decode_tokens_per_second"] or 0) <= 0:
+            raise ResultArtifactError(f"Real MLX row {index} has invalid decode throughput")
+        resources = row["resources"]
+        if int(resources["peak_mlx_memory_bytes"] or 0) <= 0:
+            raise ResultArtifactError(f"Real MLX row {index} is missing peak MLX memory")
+        if int(resources["disk_free_before_bytes"] or 0) <= 0 or int(resources["disk_free_after_bytes"] or 0) <= 0:
+            raise ResultArtifactError(f"Real MLX row {index} is missing disk measurements")
+        for key in (
+            "memory_pressure_before",
+            "memory_pressure_after",
+            "swap_used_before_bytes",
+            "swap_used_after_bytes",
+            "swap_delta_bytes",
+        ):
+            if resources.get(key) is None:
+                raise ResultArtifactError(f"Real MLX row {index} is missing {key}")
+
+    _require_keys(summary, ["performance", "resources"], "summary.json")
+    _require_keys(
+        summary["performance"],
+        ["cold_load_seconds", "wall_seconds", "generated_tokens", "decode_tokens_per_second"],
+        "summary.performance",
+    )
+    _require_keys(
+        summary["resources"],
+        [
+            "peak_mlx_memory_bytes",
+            "disk_free_before_bytes",
+            "disk_free_after_bytes",
+            "swap_delta_bytes",
+            "memory_pressure_after",
+        ],
+        "summary.resources",
+    )
 
 
 def load_run_artifacts(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:

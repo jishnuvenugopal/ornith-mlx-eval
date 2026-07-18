@@ -133,6 +133,18 @@ class TestMockRunArtifacts:
         assert '"hidden_answer"' not in combined
         assert '"expected_answer"' not in combined
 
+    def test_inconsistent_summary_totals_are_rejected(self, tmp_path):
+        run_dir = _run_mock(tmp_path / "runs")
+        summary_path = run_dir / "summary.json"
+        summary = _load_json(summary_path)
+        summary["totals"]["failed"] += 1
+        summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+        result = _cli(["report", str(run_dir)])
+
+        assert result.returncode != 0
+        assert "totals.failed" in result.stderr
+
     def test_limit_marks_run_smoke_only_and_limits_scored_cases(self, tmp_path):
         run_dir = _run_mock(tmp_path / "runs", "--limit", "2")
 
@@ -243,6 +255,41 @@ class TestCompareCommand:
         assert run_a.name in text
         assert run_b.name in text
 
+    def test_compare_includes_performance_and_resource_deltas(self, tmp_path):
+        root = tmp_path / "runs"
+        run_a = _run_mock(root)
+        run_b = _run_mock(root)
+        for run_dir, wall, generated, peak, swap in [
+            (run_a, 1.25, 10, 1000, 0),
+            (run_b, 2.50, 20, 2000, 512),
+        ]:
+            summary_path = run_dir / "summary.json"
+            summary = _load_json(summary_path)
+            summary["performance"] = {
+                "wall_seconds": wall,
+                "generated_tokens": generated,
+                "decode_tokens_per_second": generated / wall,
+            }
+            summary["resources"] = {
+                "peak_mlx_memory_bytes": peak,
+                "disk_free_after_bytes": 50_000 - peak,
+                "memory_pressure_after": 75,
+                "swap_delta_bytes": swap,
+            }
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+        result = _cli(["compare", str(run_a), str(run_b)])
+
+        assert result.returncode == 0, result.stderr
+        output_path = root / f"compare_{run_a.name}_vs_{run_b.name}.md"
+        text = output_path.read_text(encoding="utf-8")
+        assert "## Performance Delta" in text
+        assert "Wall seconds: `1.250000` -> `2.500000`" in text
+        assert "Generated tokens: `10` -> `20`" in text
+        assert "## Resource Delta" in text
+        assert "Peak MLX memory bytes: `1000` -> `2000`" in text
+        assert "Swap delta bytes: `0` -> `512`" in text
+
     def test_compare_refuses_fixed_invariant_mismatch_by_default(self, tmp_path):
         root = tmp_path / "runs"
         run_a = _run_mock(root)
@@ -282,3 +329,19 @@ class TestCompareCommand:
         assert result.returncode == 0, result.stderr
         assert output.exists()
         assert "# Ornith MLX Eval Comparison" in output.read_text(encoding="utf-8")
+
+    def test_compare_requires_explicit_output_for_different_run_parents(self, tmp_path):
+        run_a = _run_mock(tmp_path / "runs-a")
+        run_b = _run_mock(tmp_path / "runs-b")
+
+        result = _cli(["compare", str(run_a), str(run_b)])
+
+        assert result.returncode != 0
+        assert "--output" in result.stderr
+
+        output = tmp_path / "comparisons" / "cross-root.md"
+        result = _cli(
+            ["compare", str(run_a), str(run_b), "--output", str(output)]
+        )
+        assert result.returncode == 0, result.stderr
+        assert output.exists()

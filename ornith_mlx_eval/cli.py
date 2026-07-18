@@ -194,6 +194,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "ORNITH_MLX_ALLOW_MODEL_DOWNLOAD=1 is also set"
         ),
     )
+    run_p.add_argument(
+        "--promotion-source",
+        help="Fresh completed 4bit smoke manifest required for a 6bit MLX run",
+    )
 
     # ---- report -----------------------------------------------------------
     report_p = subparsers.add_parser(
@@ -220,7 +224,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     compare_p.add_argument(
         "--output",
-        help="Compare output path (default: benchmark_results/compare_<a>_vs_<b>.md)",
+        help=(
+            "Compare output path; defaults beside the runs when both inputs "
+            "share a parent, otherwise required"
+        ),
     )
     compare_p.add_argument(
         "--allow-mismatch",
@@ -313,29 +320,54 @@ def _cmd_validate_suite(args: argparse.Namespace) -> int:
 
 def _cmd_smoke(args: argparse.Namespace) -> int:
     """smoke – run gated real MLX smoke only after explicit opt-in."""
-    from ornith_mlx_eval.mlx_session import MlxSessionError, run_real_smoke
+    from ornith_mlx_eval.results import ResultArtifactError, load_run_artifacts
+    from ornith_mlx_eval.runner import RunOptions, run_evaluation
 
     try:
-        result = run_real_smoke(
-            args.model,
-            allow_download=args.allow_download,
-            promotion_source=args.promotion_source,
-            max_tokens=args.max_tokens,
-            seed=args.seed if args.seed is not None else 42,
-            temperature=args.temperature if args.temperature is not None else 0,
-            top_p=args.top_p if args.top_p is not None else 1,
-            top_k=args.top_k if args.top_k is not None else 0,
-            max_prompt_tokens=args.max_prompt_tokens,
-            max_kv_size=args.max_kv_size,
+        run_dir = run_evaluation(
+            RunOptions(
+                runtime="mlx",
+                suite="smoke",
+                model=args.model,
+                output_root=args.output_root,
+                limit=1,
+                seed=args.seed,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                max_tokens=min(args.max_tokens, 32),
+                max_prompt_tokens=args.max_prompt_tokens,
+                max_kv_size=args.max_kv_size,
+                allow_download=args.allow_download,
+                promotion_source=args.promotion_source,
+            )
         )
-    except MlxSessionError as exc:
+        manifest, rows, summary = load_run_artifacts(run_dir)
+    except ResultArtifactError as exc:
         print(f"smoke failed: {exc}", file=sys.stderr)
         return 1
+    if (
+        not rows
+        or not str(rows[0].get("parse", {}).get("final_text", "")).strip()
+        or summary["totals"]["failed"]
+    ):
+        print(
+            f"smoke failed: model output did not pass the one-case smoke; artifacts: {run_dir}",
+            file=sys.stderr,
+        )
+        return 1
+    performance = summary["performance"]
+    resources = summary["resources"]
     print("Smoke status: PASS")
-    print(f"Model: {result['model_id']}")
-    print(f"Revision: {result['revision']}")
+    print(f"Model: {manifest['model']['repo_id']}")
+    print(f"Revision: {manifest['model']['revision']}")
     print("Classification: smoke-only")
-    print(f"Generated tokens: {result['generated_tokens']}")
+    print(f"Generated tokens: {performance['generated_tokens']}")
+    print(f"Cold load seconds: {performance['cold_load_seconds']:.3f}")
+    print(f"Wall seconds: {performance['wall_seconds']:.3f}")
+    print(f"Decode tokens/second: {performance['decode_tokens_per_second']:.3f}")
+    print(f"Peak MLX memory bytes: {resources['peak_mlx_memory_bytes']}")
+    print(f"Run directory: {run_dir}")
     return 0
 
 
@@ -360,6 +392,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 max_prompt_tokens=args.max_prompt_tokens,
                 max_kv_size=args.max_kv_size,
                 allow_download=args.allow_download,
+                promotion_source=args.promotion_source,
             )
         )
     except ResultArtifactError as exc:

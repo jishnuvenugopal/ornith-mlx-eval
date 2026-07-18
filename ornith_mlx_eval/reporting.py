@@ -111,17 +111,36 @@ def render_report(
     else:
         lines.append("- None")
 
+    performance = summary.get("performance", {})
+    resources = summary.get("resources", {})
     lines.extend([
         "",
         "## Performance",
         "",
         f"- Total wall time seconds: `{sum(float(row['timing']['wall_seconds']) for row in rows):.6f}`",
         f"- Total generated tokens: `{sum(int(row['tokens']['generated']) for row in rows)}`",
+    ])
+    if runtime["kind"] == "mlx":
+        lines.extend([
+            f"- Cold-load time seconds: `{float(performance.get('cold_load_seconds', 0)):.6f}`",
+            f"- First-token time seconds: `{max((float(row['timing'].get('first_token_seconds', 0)) for row in rows), default=0):.6f}`",
+            f"- Decode tokens per second: `{float(performance.get('decode_tokens_per_second', 0)):.6f}`",
+        ])
+    lines.extend([
         "",
         "## Resources",
         "",
         f"- Peak MLX memory bytes: `{max(int(row['resources'].get('peak_mlx_memory_bytes', 0)) for row in rows) if rows else 0}`",
         f"- Runtime resource status: `{runtime.get('resource_status', 'not-measured')}`",
+    ])
+    if runtime["kind"] == "mlx":
+        lines.extend([
+            f"- Disk free before bytes: `{int(resources.get('disk_free_before_bytes', 0) or 0)}`",
+            f"- Disk free after bytes: `{int(resources.get('disk_free_after_bytes', 0) or 0)}`",
+            f"- Memory pressure after: `{resources.get('memory_pressure_after', 'unavailable')}`",
+            f"- Swap delta bytes: `{resources.get('swap_delta_bytes', 'unavailable')}`",
+        ])
+    lines.extend([
         "",
         "## Caveats",
         "",
@@ -139,6 +158,10 @@ def compare_runs(run_a: Path, run_b: Path, *, output: Path | None = None, allow_
     """Compare two completed persisted runs and write Markdown output."""
     manifest_a, rows_a, summary_a = load_run_artifacts(run_a)
     manifest_b, rows_b, summary_b = load_run_artifacts(run_b)
+    if output is None and run_a.resolve().parent != run_b.resolve().parent:
+        raise ResultArtifactError(
+            "Runs with different parent directories require an explicit --output path"
+        )
 
     mismatches = _fixed_mismatches(manifest_a, manifest_b)
     smoke_only = bool(summary_a.get("smoke_only") or summary_b.get("smoke_only"))
@@ -164,7 +187,9 @@ def compare_runs(run_a: Path, run_b: Path, *, output: Path | None = None, allow_
         qualitative=bool(mismatches),
     )
 
-    output_path = output or (run_a.parent / f"compare_{run_a.name}_vs_{run_b.name}.md")
+    output_path = output or (
+        run_a.parent / f"compare_{run_a.name}_vs_{run_b.name}.md"
+    )
     output_path = output_path.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(markdown, encoding="utf-8")
@@ -216,6 +241,28 @@ def render_compare(
         f"- Passed: `{summary_a['totals']['passed']}` -> `{summary_b['totals']['passed']}`",
         f"- Failed: `{summary_a['totals']['failed']}` -> `{summary_b['totals']['failed']}`",
         "",
+        "## Performance Delta",
+        "",
+        f"- Wall seconds: `{_summary_float(summary_a, 'performance', 'wall_seconds'):.6f}` -> "
+        f"`{_summary_float(summary_b, 'performance', 'wall_seconds'):.6f}`",
+        f"- Generated tokens: `{_summary_int(summary_a, 'performance', 'generated_tokens')}` -> "
+        f"`{_summary_int(summary_b, 'performance', 'generated_tokens')}`",
+        f"- Decode tokens per second: "
+        f"`{_summary_float(summary_a, 'performance', 'decode_tokens_per_second'):.6f}` -> "
+        f"`{_summary_float(summary_b, 'performance', 'decode_tokens_per_second'):.6f}`",
+        "",
+        "## Resource Delta",
+        "",
+        f"- Peak MLX memory bytes: `{_summary_int(summary_a, 'resources', 'peak_mlx_memory_bytes')}` -> "
+        f"`{_summary_int(summary_b, 'resources', 'peak_mlx_memory_bytes')}`",
+        f"- Disk free after bytes: `{_summary_int(summary_a, 'resources', 'disk_free_after_bytes')}` -> "
+        f"`{_summary_int(summary_b, 'resources', 'disk_free_after_bytes')}`",
+        f"- Memory pressure after: "
+        f"`{_summary_value(summary_a, 'resources', 'memory_pressure_after')}` -> "
+        f"`{_summary_value(summary_b, 'resources', 'memory_pressure_after')}`",
+        f"- Swap delta bytes: `{_summary_int(summary_a, 'resources', 'swap_delta_bytes')}` -> "
+        f"`{_summary_int(summary_b, 'resources', 'swap_delta_bytes')}`",
+        "",
         "## Caveats",
         "",
     ])
@@ -254,3 +301,18 @@ def _get_path(obj: dict[str, Any], path: tuple[str, ...]) -> Any:
             return None
         current = current.get(key)
     return current
+
+
+def _summary_value(summary: dict[str, Any], section: str, key: str) -> Any:
+    value = summary.get(section, {}).get(key)
+    return "not-measured" if value is None else value
+
+
+def _summary_float(summary: dict[str, Any], section: str, key: str) -> float:
+    value = summary.get(section, {}).get(key)
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def _summary_int(summary: dict[str, Any], section: str, key: str) -> int:
+    value = summary.get(section, {}).get(key)
+    return int(value) if isinstance(value, (int, float)) else 0
