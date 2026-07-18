@@ -5,6 +5,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from ornith_mlx_eval import __version__
+
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -66,6 +68,12 @@ def test_dependency_pins_are_exact():
         "jsonschema==4.26.0",
     ]:
         assert pin in pyproject
+
+
+def test_package_and_project_versions_match_v020():
+    pyproject = (_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert __version__ == "0.2.0"
+    assert 'version = "0.2.0"' in pyproject
 
 
 def test_public_tree_contains_readme_and_no_upstream_copied_artifacts():
