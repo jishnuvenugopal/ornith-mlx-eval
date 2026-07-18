@@ -126,6 +126,52 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to a fresh 4bit smoke manifest required for 6bit promotion",
     )
 
+    # ---- perf -------------------------------------------------------------
+    perf_p = subparsers.add_parser(
+        "perf",
+        help="Run a warmed gated MLX throughput probe",
+    )
+    perf_p.add_argument("--model", required=True, help="Pinned supported model ID")
+    perf_p.add_argument(
+        "--trials", type=int, default=3, help="Measured trial count (default: 3)"
+    )
+    perf_p.add_argument(
+        "--decode-tokens",
+        type=int,
+        default=128,
+        help="Fixed generated tokens per measured trial (default: 128)",
+    )
+    perf_p.add_argument(
+        "--warmup-tokens",
+        type=int,
+        default=16,
+        help="Discarded warmup generation tokens (default: 16)",
+    )
+    perf_p.add_argument("--seed", type=int, default=42, help="Generation seed")
+    perf_p.add_argument(
+        "--output-root",
+        default="benchmark_results",
+        help="Output root directory (default: benchmark_results)",
+    )
+    perf_p.add_argument(
+        "--max-prompt-tokens", type=int, default=8192, help="Maximum prompt tokens"
+    )
+    perf_p.add_argument(
+        "--max-kv-size", type=int, default=4096, help="Maximum KV cache size"
+    )
+    perf_p.add_argument(
+        "--allow-download",
+        action="store_true",
+        help=(
+            "Explicitly allow real model downloads when "
+            "ORNITH_MLX_ALLOW_MODEL_DOWNLOAD=1 is also set"
+        ),
+    )
+    perf_p.add_argument(
+        "--promotion-source",
+        help="Fresh completed 4bit smoke manifest required for a 6bit perf probe",
+    )
+
     # ---- run --------------------------------------------------------------
     run_p = subparsers.add_parser(
         "run",
@@ -372,7 +418,11 @@ def _cmd_smoke(args: argparse.Namespace) -> int:
     print(f"Generated tokens: {performance['generated_tokens']}")
     print(f"Cold load seconds: {performance['cold_load_seconds']:.3f}")
     print(f"Wall seconds: {performance['wall_seconds']:.3f}")
-    print(f"Decode tokens/second: {performance['decode_tokens_per_second']:.3f}")
+    print(
+        "Decode tokens/second: "
+        f"{performance['decode_tokens_per_second']:.3f} "
+        "(smoke, not a throughput measurement)"
+    )
     print(f"Peak MLX memory bytes: {resources['peak_mlx_memory_bytes']}")
     print(f"Run directory: {run_dir}")
     return 0
@@ -405,6 +455,48 @@ def _cmd_run(args: argparse.Namespace) -> int:
     except ResultArtifactError as exc:
         print(f"run failed: {exc}", file=sys.stderr)
         return 1
+    print(f"Run directory: {run_dir}")
+    return 0
+
+
+def _cmd_perf(args: argparse.Namespace) -> int:
+    """perf – run one warmed multi-trial throughput probe."""
+    from ornith_mlx_eval.mlx_session import MlxSessionError
+    from ornith_mlx_eval.perf import PerfOptions, load_perf_artifact, run_perf_probe
+    from ornith_mlx_eval.results import ResultArtifactError
+
+    try:
+        run_dir = run_perf_probe(
+            PerfOptions(
+                model=args.model,
+                output_root=args.output_root,
+                trials=args.trials,
+                decode_tokens=args.decode_tokens,
+                warmup_tokens=args.warmup_tokens,
+                seed=args.seed,
+                max_prompt_tokens=args.max_prompt_tokens,
+                max_kv_size=args.max_kv_size,
+                allow_download=args.allow_download,
+                promotion_source=args.promotion_source,
+            )
+        )
+        perf = load_perf_artifact(run_dir)
+    except (MlxSessionError, ResultArtifactError, ValueError) as exc:
+        print(f"perf failed: {exc}", file=sys.stderr)
+        return 1
+
+    aggregate = perf["aggregate"]
+    headline = perf["headline"]
+    print("Perf status: PASS")
+    print(f"Median measured tokens/second: {aggregate['median_tps']:.3f}")
+    print(f"CV: {aggregate['cv']:.3%}")
+    if headline["status"] == "publishable":
+        print(
+            "Headline decode tokens/second: "
+            f"{headline['decode_tokens_per_second']:.3f}"
+        )
+    else:
+        print("Headline: unstable (" + "; ".join(headline["reasons"]) + ")")
     print(f"Run directory: {run_dir}")
     return 0
 
@@ -454,6 +546,7 @@ _DISPATCH: dict[str, callable] = {
     "list-suites": _cmd_list_suites,
     "validate-suite": _cmd_validate_suite,
     "smoke": _cmd_smoke,
+    "perf": _cmd_perf,
     "run": _cmd_run,
     "report": _cmd_report,
     "compare": _cmd_compare,

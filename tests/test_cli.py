@@ -24,6 +24,7 @@ EXPECTED_COMMANDS = [
     "list-suites",
     "validate-suite",
     "smoke",
+    "perf",
     "run",
     "report",
     "compare",
@@ -259,6 +260,18 @@ class TestHelpDocumentsWorkflow:
     def test_smoke_help_documents_output_root(self):
         result = _cli(["smoke", "--help"])
         assert "--output-root" in result.stdout
+
+    def test_perf_help_documents_trial_controls_and_download_gate(self):
+        result = _cli(["perf", "--help"])
+        for opt in [
+            "--model",
+            "--trials",
+            "--decode-tokens",
+            "--warmup-tokens",
+            "--allow-download",
+            "--promotion-source",
+        ]:
+            assert opt in result.stdout, f"missing '{opt}' in perf --help"
 
     def test_smoke_help_documents_decoding_options(self):
         result = _cli(["smoke", "--help"])
