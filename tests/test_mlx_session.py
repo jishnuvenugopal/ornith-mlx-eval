@@ -7,6 +7,7 @@ to verify API wiring and gate behavior.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -42,6 +43,7 @@ class FakeChunk:
         prompt_tps: float = 35.0,
         generation_tps: float = 12.5,
         peak_memory: float = 0.25,
+        token: int = 1,
     ):
         self.text = text
         self.prompt_tokens = prompt_tokens
@@ -49,14 +51,17 @@ class FakeChunk:
         self.prompt_tps = prompt_tps
         self.generation_tps = generation_tps
         self.peak_memory = peak_memory
+        self.token = token
 
 
 class FakeMx:
     def __init__(self):
         self.seed_values = []
         self.reset_called = False
+        self.reset_count = 0
         self.clear_called = False
         self.events = []
+        self.memory_limits = []
 
         class Random:
             def __init__(self, outer):
@@ -69,7 +74,13 @@ class FakeMx:
 
     def reset_peak_memory(self):
         self.reset_called = True
+        self.reset_count += 1
         self.events.append("reset")
+
+    def set_memory_limit(self, value):
+        self.memory_limits.append(value)
+        self.events.append("memory-limit")
+        return 0
 
     def get_peak_memory(self):
         return 123456
@@ -98,12 +109,12 @@ class FakeApi:
 
     def make_prompt_cache(self, model, *, max_kv_size):
         self.cache_calls.append({"model": model, "max_kv_size": max_kv_size})
-        return "prompt-cache"
+        return f"prompt-cache-{len(self.cache_calls)}"
 
     def stream_generate(self, model, tokenizer, prompt, **kwargs):
         self.stream_kwargs = kwargs
-        yield FakeChunk("Par", generation_tokens=1)
-        yield FakeChunk("is", generation_tokens=2)
+        yield FakeChunk("Par", generation_tokens=1, token=101)
+        yield FakeChunk("is", generation_tokens=2, token=102)
 
 
 class FakeChatTokenizer:
@@ -169,6 +180,7 @@ def _measured_generation(
     model_id: str = FOUR_BIT_MODEL,
     revision: str = FOUR_BIT_SHA,
 ) -> MlxGenerationResult:
+    token_ids = (101, 102)
     return MlxGenerationResult(
         raw_text=raw_text,
         prompt_tokens=7,
@@ -177,11 +189,17 @@ def _measured_generation(
         model_id=model_id,
         revision=revision,
         max_kv_size=2048,
+        token_ids=token_ids,
+        response_sha256=hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+        token_ids_sha256=hashlib.sha256(
+            json.dumps(token_ids, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
         cold_load_seconds=0.5,
         first_token_seconds=0.2,
-        decode_seconds=0.16,
+        decode_seconds=0.08,
         decode_tokens_per_second=12.5,
         prompt_tokens_per_second=35.0,
+        runtime_reported_tps=12.5,
         wall_seconds=0.86,
         disk_free_before_bytes=50 * 1024**3,
         disk_free_after_bytes=50 * 1024**3,
@@ -248,13 +266,16 @@ class TestMlxSessionCore:
         assert api.mx.seed_values == [123]
         assert api.cache_calls == [{"model": "model", "max_kv_size": 2048}]
         assert api.mx.reset_called is True
-        assert api.mx.events.index("reset") < api.mx.events.index("load")
+        assert api.mx.events.index("load") < api.mx.events.index("reset")
         assert api.mx.clear_called is True
         assert result.raw_text == "Paris"
         assert result.peak_mlx_memory_bytes == 250_000_000
         assert result.prompt_tokens == 7
         assert result.generated_tokens == 2
-        assert result.decode_tokens_per_second == 12.5
+        assert result.token_ids == (101, 102)
+        assert result.response_sha256 == hashlib.sha256(b"Paris").hexdigest()
+        assert result.decode_tokens_per_second > 0
+        assert result.runtime_reported_tps == 12.5
         assert result.wall_seconds > 0
 
     def test_stream_generate_receives_sampler_and_prompt_cache_not_unsupported_kwargs(self):
@@ -269,7 +290,7 @@ class TestMlxSessionCore:
 
         kwargs = api.stream_kwargs
         assert kwargs["sampler"] == "sampler"
-        assert kwargs["prompt_cache"] == "prompt-cache"
+        assert kwargs["prompt_cache"] == "prompt-cache-1"
         assert kwargs["max_tokens"] == 512
         for unsupported in ["temperature", "top_p", "top_k", "seed"]:
             assert unsupported not in kwargs
@@ -335,6 +356,121 @@ class TestMlxSessionCore:
             )
         assert api.mx.clear_called is True
 
+    def test_loaded_session_reuses_one_load_with_fresh_cache_reseed_and_memory_limit(self):
+        from ornith_mlx_eval.mlx_session import open_mlx_session
+
+        api = FakeApi()
+        options = MlxGenerationOptions(seed=17, max_kv_size=2048)
+        with open_mlx_session(
+            FOUR_BIT_MODEL,
+            FOUR_BIT_SHA,
+            options,
+            api=api,
+            memory_limit_bytes=7_000_000_000,
+        ) as session:
+            first = session.generate("Prompt", options)
+            second = session.generate("Prompt", options)
+
+        assert api.load_calls == [(FOUR_BIT_MODEL, FOUR_BIT_SHA)]
+        assert api.mx.events.index("memory-limit") < api.mx.events.index("load")
+        assert api.mx.memory_limits == [7_000_000_000]
+        assert api.mx.reset_count == 2
+        assert api.mx.seed_values == [17, 17]
+        assert [call["max_kv_size"] for call in api.cache_calls] == [2048, 2048]
+        assert first.token_ids_sha256 == second.token_ids_sha256
+        assert first.response_sha256 == second.response_sha256
+        assert first.cold_load_seconds >= 0
+        assert second.cold_load_seconds == 0
+
+    def test_real_generation_fails_closed_when_chunk_token_metrics_are_missing(self):
+        from ornith_mlx_eval.mlx_session import open_mlx_session
+
+        api = FakeApi()
+
+        class TextOnlyChunk:
+            text = "Paris"
+
+        api.stream_generate = lambda *args, **kwargs: iter([TextOnlyChunk()])
+        with open_mlx_session(
+            FOUR_BIT_MODEL,
+            FOUR_BIT_SHA,
+            MlxGenerationOptions(),
+            api=api,
+        ) as session:
+            with pytest.raises(MlxSessionError, match="token metrics"):
+                session.generate("Prompt", MlxGenerationOptions())
+
+    def test_same_seed_repeats_match_and_a_different_seed_may_diverge(self):
+        from ornith_mlx_eval.mlx_session import open_mlx_session
+
+        api = FakeApi()
+
+        def stream(model, tokenizer, prompt, **kwargs):
+            token = api.mx.seed_values[-1]
+            yield FakeChunk(str(token), generation_tokens=1, token=token)
+
+        api.stream_generate = stream
+        with open_mlx_session(
+            FOUR_BIT_MODEL,
+            FOUR_BIT_SHA,
+            MlxGenerationOptions(temperature=0.7),
+            api=api,
+        ) as session:
+            first = session.generate("Prompt", MlxGenerationOptions(seed=11, temperature=0.7))
+            second = session.generate("Prompt", MlxGenerationOptions(seed=11, temperature=0.7))
+            different = session.generate("Prompt", MlxGenerationOptions(seed=12, temperature=0.7))
+
+        assert first.token_ids == second.token_ids
+        assert first.token_ids != different.token_ids
+
+    def test_session_reuse_matches_fresh_session_with_fresh_prompt_caches(self):
+        from ornith_mlx_eval.mlx_session import open_mlx_session
+
+        options = MlxGenerationOptions(seed=42)
+        reused_api = FakeApi()
+        with open_mlx_session(
+            FOUR_BIT_MODEL, FOUR_BIT_SHA, options, api=reused_api
+        ) as reused:
+            reused_first = reused.generate("Prompt", options)
+            reused_second = reused.generate("Prompt", options)
+
+        fresh_api = FakeApi()
+        with open_mlx_session(
+            FOUR_BIT_MODEL, FOUR_BIT_SHA, options, api=fresh_api
+        ) as fresh:
+            fresh_result = fresh.generate("Prompt", options)
+
+        assert len(reused_api.cache_calls) == 2
+        assert reused_first.token_ids_sha256 == reused_second.token_ids_sha256
+        assert reused_second.token_ids_sha256 == fresh_result.token_ids_sha256
+
+    def test_decode_window_uses_first_and_last_chunk_timestamps_not_runtime_tps(self):
+        from ornith_mlx_eval.mlx_session import open_mlx_session
+
+        api = FakeApi()
+
+        def stream(model, tokenizer, prompt, **kwargs):
+            yield FakeChunk("A", generation_tokens=1, generation_tps=999.0, token=1)
+            yield FakeChunk("B", generation_tokens=2, generation_tps=999.0, token=2)
+            yield FakeChunk("C", generation_tokens=3, generation_tps=999.0, token=3)
+
+        api.stream_generate = stream
+        clock_values = iter([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 11.0])
+        clock = lambda: next(clock_values)
+        with open_mlx_session(
+            FOUR_BIT_MODEL,
+            FOUR_BIT_SHA,
+            MlxGenerationOptions(),
+            api=api,
+            clock=clock,
+        ) as session:
+            result = session.generate("Prompt", MlxGenerationOptions())
+
+        assert result.first_token_seconds == 1.0
+        assert result.decode_seconds == 5.0
+        assert result.decode_tokens_per_second == 0.4
+        assert result.runtime_reported_tps == 999.0
+
 
 class TestSmokeCliGates:
     def test_smoke_requires_explicit_real_model_opt_in(self):
@@ -394,6 +530,167 @@ class TestSmokeCliGates:
 
 
 class TestMlxRunnerAdapter:
+    def test_repeats_persist_identical_token_and_text_hash_evidence_from_one_load(
+        self, tmp_path, monkeypatch
+    ):
+        from ornith_mlx_eval import runner as runner_module
+
+        api = FakeApi()
+        snapshot = tmp_path / "snapshot"
+        snapshot.mkdir()
+        (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
+        (snapshot / "chat_template.jinja").write_text("{{ messages }}", encoding="utf-8")
+        monkeypatch.setenv("ORNITH_MLX_ALLOW_MODEL_DOWNLOAD", "1")
+        monkeypatch.setattr(runner_module, "run_profile", lambda **kwargs: _passing_profile())
+        monkeypatch.setattr(
+            runner_module,
+            "_cached_snapshot_status",
+            lambda *args: {"status": "hit-complete", "path": str(snapshot)},
+        )
+
+        run_dir = run_evaluation(
+            RunOptions(
+                runtime="mlx",
+                suite="smoke",
+                model=FOUR_BIT_MODEL,
+                output_root=str(tmp_path / "runs"),
+                limit=1,
+                repeats=3,
+                allow_download=True,
+            ),
+            mlx_api=api,
+        )
+
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        row = json.loads((run_dir / "results.jsonl").read_text(encoding="utf-8"))
+        summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+        report = (run_dir / "report.md").read_text(encoding="utf-8")
+        assert api.load_calls == [(FOUR_BIT_MODEL, FOUR_BIT_SHA)]
+        assert manifest["settings"]["repeats"] == 3
+        assert row["response_sha256"] == hashlib.sha256(b"Paris").hexdigest()
+        assert len(row["token_ids_sha256"]) == 64
+        assert row["determinism"]["repeats"] == 3
+        assert row["determinism"]["identical_token_ids"] is True
+        assert row["determinism"]["identical_text"] is True
+        assert len(row["determinism"]["per_repeat_hashes"]) == 3
+        assert summary["determinism"]["status"] == "identical"
+        assert "## Determinism" in report
+        assert "Token IDs identical: `true`" in report
+
+    def test_repeat_divergence_is_persisted_and_exits_nonzero(self, tmp_path, monkeypatch):
+        from ornith_mlx_eval import runner as runner_module
+
+        api = FakeApi()
+        stream_calls = 0
+
+        def divergent_stream(model, tokenizer, prompt, **kwargs):
+            nonlocal stream_calls
+            stream_calls += 1
+            token = 100 + stream_calls
+            yield FakeChunk(str(token), generation_tokens=1, token=token)
+
+        api.stream_generate = divergent_stream
+        snapshot = tmp_path / "snapshot"
+        snapshot.mkdir()
+        (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
+        (snapshot / "chat_template.jinja").write_text("{{ messages }}", encoding="utf-8")
+        monkeypatch.setenv("ORNITH_MLX_ALLOW_MODEL_DOWNLOAD", "1")
+        monkeypatch.setattr(runner_module, "run_profile", lambda **kwargs: _passing_profile())
+        monkeypatch.setattr(
+            runner_module,
+            "_cached_snapshot_status",
+            lambda *args: {"status": "hit-complete", "path": str(snapshot)},
+        )
+        output_root = tmp_path / "runs"
+
+        with pytest.raises(Exception, match="determinism divergence"):
+            run_evaluation(
+                RunOptions(
+                    runtime="mlx",
+                    suite="smoke",
+                    model=FOUR_BIT_MODEL,
+                    output_root=str(output_root),
+                    limit=1,
+                    repeats=2,
+                    allow_download=True,
+                ),
+                mlx_api=api,
+            )
+
+        run_dir = next(output_root.iterdir())
+        row = json.loads((run_dir / "results.jsonl").read_text(encoding="utf-8"))
+        summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+        assert row["determinism"]["identical_token_ids"] is False
+        assert summary["determinism"]["status"] == "divergent"
+        assert any(error["type"] == "determinism_divergence" for error in row["errors"])
+
+    def test_missing_real_token_metrics_persist_an_error_row_before_nonzero_exit(
+        self, tmp_path, monkeypatch
+    ):
+        from ornith_mlx_eval import runner as runner_module
+
+        api = FakeApi()
+
+        class TextOnlyChunk:
+            text = "Paris"
+
+        api.stream_generate = lambda *args, **kwargs: iter([TextOnlyChunk()])
+        snapshot = tmp_path / "snapshot"
+        snapshot.mkdir()
+        (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
+        (snapshot / "chat_template.jinja").write_text("{{ messages }}", encoding="utf-8")
+        monkeypatch.setenv("ORNITH_MLX_ALLOW_MODEL_DOWNLOAD", "1")
+        monkeypatch.setattr(runner_module, "run_profile", lambda **kwargs: _passing_profile())
+        monkeypatch.setattr(
+            runner_module,
+            "_cached_snapshot_status",
+            lambda *args: {"status": "hit-complete", "path": str(snapshot)},
+        )
+        output_root = tmp_path / "runs"
+
+        with pytest.raises(Exception, match="token metrics"):
+            run_evaluation(
+                RunOptions(
+                    runtime="mlx",
+                    suite="smoke",
+                    model=FOUR_BIT_MODEL,
+                    output_root=str(output_root),
+                    limit=1,
+                    allow_download=True,
+                ),
+                mlx_api=api,
+            )
+
+        run_dir = next(output_root.iterdir())
+        row = json.loads((run_dir / "results.jsonl").read_text(encoding="utf-8"))
+        assert row["tokens"]["generated"] == 0
+        assert any(error["type"] == "missing_metrics" for error in row["errors"])
+        assert not (run_dir / ".incomplete").exists()
+
+    @pytest.mark.parametrize("repeats", [0, 6])
+    def test_repeats_are_bounded_before_profile_or_output(
+        self, repeats, tmp_path, monkeypatch
+    ):
+        from ornith_mlx_eval import runner as runner_module
+
+        profile_calls = []
+        monkeypatch.setattr(
+            runner_module,
+            "run_profile",
+            lambda **kwargs: profile_calls.append(kwargs) or _passing_profile(),
+        )
+        with pytest.raises(Exception, match="repeats"):
+            run_evaluation(
+                RunOptions(
+                    runtime="mlx",
+                    suite="smoke",
+                    model=FOUR_BIT_MODEL,
+                    output_root=str(tmp_path / "runs"),
+                    repeats=repeats,
+                )
+            )
+        assert profile_calls == []
+        assert not (tmp_path / "runs").exists()
     def test_mlx_runtime_requires_explicit_download_opt_in_before_output(self, tmp_path):
         output_root = tmp_path / "runs"
         with pytest.raises(Exception, match="explicit opt-in"):
@@ -477,7 +774,7 @@ class TestMlxRunnerAdapter:
         assert "Cold-load time seconds: `0.500000`" in report
         assert "Decode tokens per second: `12.500000`" in report
         assert "Disk free before bytes:" in report
-        assert "Memory pressure after:" in report
+        assert "Memory percent-free after:" in report
         assert calls[0][0] == FOUR_BIT_MODEL
         assert calls[0][1] == FOUR_BIT_SHA
         assert calls[0][3] == 2048
@@ -716,6 +1013,18 @@ class TestMlxRunnerAdapter:
         summary_path.write_text(json.dumps(summary), encoding="utf-8")
 
         with pytest.raises(MlxSessionError, match=message):
+            validate_6bit_promotion_source(str(run_dir / "manifest.json"))
+
+    def test_6bit_promotion_rejects_projected_peak_above_working_set_budget(
+        self, tmp_path, monkeypatch
+    ):
+        run_dir = _create_passing_4bit_source(tmp_path, monkeypatch)
+        summary_path = run_dir / "summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary["resources"]["peak_mlx_memory_bytes"] = 5 * 1024**3
+        summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+        with pytest.raises(MlxSessionError, match="projected 6bit peak"):
             validate_6bit_promotion_source(str(run_dir / "manifest.json"))
 
     def test_6bit_fake_runtime_uses_exact_revision_after_promotion_gate(

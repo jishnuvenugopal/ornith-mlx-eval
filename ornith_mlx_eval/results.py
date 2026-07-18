@@ -257,26 +257,56 @@ def _validate_mlx_evidence(
             raise ResultArtifactError(
                 f"Real MLX row {index} missing resource fields: {', '.join(missing_resources)}"
             )
-        if float(row["timing"]["wall_seconds"] or 0) <= 0:
-            raise ResultArtifactError(f"Real MLX row {index} has invalid wall timing")
-        if int(row["tokens"]["prompt"] or 0) <= 0 or int(row["tokens"]["generated"] or 0) <= 0:
-            raise ResultArtifactError(f"Real MLX row {index} has invalid token counts")
-        if float(row["timing"]["decode_tokens_per_second"] or 0) <= 0:
-            raise ResultArtifactError(f"Real MLX row {index} has invalid decode throughput")
+        has_evidence_error = any(
+            error.get("type") in {"runtime_error", "missing_metrics"}
+            for error in row.get("errors", [])
+        )
         resources = row["resources"]
-        if int(resources["peak_mlx_memory_bytes"] or 0) <= 0:
-            raise ResultArtifactError(f"Real MLX row {index} is missing peak MLX memory")
-        if int(resources["disk_free_before_bytes"] or 0) <= 0 or int(resources["disk_free_after_bytes"] or 0) <= 0:
-            raise ResultArtifactError(f"Real MLX row {index} is missing disk measurements")
-        for key in (
-            "memory_pressure_before",
-            "memory_pressure_after",
-            "swap_used_before_bytes",
-            "swap_used_after_bytes",
-            "swap_delta_bytes",
-        ):
-            if resources.get(key) is None:
-                raise ResultArtifactError(f"Real MLX row {index} is missing {key}")
+        if not has_evidence_error:
+            if float(row["timing"]["wall_seconds"] or 0) <= 0:
+                raise ResultArtifactError(f"Real MLX row {index} has invalid wall timing")
+            if int(row["tokens"]["prompt"] or 0) <= 0 or int(row["tokens"]["generated"] or 0) <= 0:
+                raise ResultArtifactError(f"Real MLX row {index} has invalid token counts")
+            if float(row["timing"]["decode_tokens_per_second"] or 0) < 0:
+                raise ResultArtifactError(f"Real MLX row {index} has invalid decode throughput")
+            if int(resources["peak_mlx_memory_bytes"] or 0) <= 0:
+                raise ResultArtifactError(f"Real MLX row {index} is missing peak MLX memory")
+            if int(resources["disk_free_before_bytes"] or 0) <= 0 or int(resources["disk_free_after_bytes"] or 0) <= 0:
+                raise ResultArtifactError(f"Real MLX row {index} is missing disk measurements")
+            for key in (
+                "memory_pressure_before",
+                "memory_pressure_after",
+                "swap_used_before_bytes",
+                "swap_used_after_bytes",
+                "swap_delta_bytes",
+            ):
+                if resources.get(key) is None:
+                    raise ResultArtifactError(f"Real MLX row {index} is missing {key}")
+
+        if "repeats" in manifest.get("settings", {}) and not has_evidence_error:
+            _require_keys(
+                row,
+                ["response_sha256", "token_ids_sha256", "determinism"],
+                f"Real MLX row {index}",
+            )
+            if len(str(row["response_sha256"])) != 64:
+                raise ResultArtifactError(
+                    f"Real MLX row {index} has invalid response_sha256"
+                )
+            if len(str(row["token_ids_sha256"])) != 64:
+                raise ResultArtifactError(
+                    f"Real MLX row {index} has invalid token_ids_sha256"
+                )
+            _require_keys(
+                row["determinism"],
+                [
+                    "repeats",
+                    "identical_token_ids",
+                    "identical_text",
+                    "per_repeat_hashes",
+                ],
+                f"Real MLX row {index}.determinism",
+            )
 
     _require_keys(summary, ["performance", "resources"], "summary.json")
     _require_keys(
@@ -295,6 +325,23 @@ def _validate_mlx_evidence(
         ],
         "summary.resources",
     )
+    if "repeats" in manifest.get("settings", {}):
+        _require_keys(
+            summary,
+            ["determinism"],
+            "summary.json",
+        )
+        _require_keys(
+            summary["determinism"],
+            ["repeats", "identical_token_ids", "identical_text", "status", "cases"],
+            "summary.determinism",
+        )
+        if summary["determinism"]["status"] not in {
+            "identical",
+            "divergent",
+            "unavailable",
+        }:
+            raise ResultArtifactError("summary.determinism status is invalid")
 
 
 def load_run_artifacts(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:

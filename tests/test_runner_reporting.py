@@ -10,6 +10,7 @@ Coverage:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -345,3 +346,34 @@ class TestCompareCommand:
         )
         assert result.returncode == 0, result.stderr
         assert output.exists()
+
+    def test_compare_reports_identical_or_divergent_response_hashes(self, tmp_path):
+        root = tmp_path / "runs"
+        run_a = _run_mock(root)
+        run_b = _run_mock(root)
+
+        def add_hashes(run_dir, suffix=""):
+            path = run_dir / "results.jsonl"
+            rows = _load_jsonl(path)
+            for row in rows:
+                text = f"{row['raw_response']}{suffix}"
+                row["response_sha256"] = hashlib.sha256(text.encode()).hexdigest()
+            path.write_text(
+                "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+        add_hashes(run_a)
+        add_hashes(run_b)
+        result = _cli(["compare", str(run_a), str(run_b)])
+        assert result.returncode == 0, result.stderr
+        output = root / f"compare_{run_a.name}_vs_{run_b.name}.md"
+        text = output.read_text(encoding="utf-8")
+        assert "## Determinism" in text
+        assert "Cross-run response hashes: `identical`" in text
+
+        add_hashes(run_b, suffix="-different")
+        result = _cli(["compare", str(run_a), str(run_b)])
+        assert result.returncode == 0, result.stderr
+        text = output.read_text(encoding="utf-8")
+        assert "Cross-run response hashes: `divergent`" in text

@@ -24,6 +24,7 @@ FIXED_COMPARE_INVARIANTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("grader_version", ("harness", "grader_version")),
     ("prompt_order", ("settings", "prompt_order")),
     ("seed", ("settings", "seed")),
+    ("repeats", ("settings", "repeats")),
     ("concurrency", ("settings", "concurrency")),
 )
 
@@ -124,8 +125,26 @@ def render_report(
         lines.extend([
             f"- Cold-load time seconds: `{float(performance.get('cold_load_seconds', 0)):.6f}`",
             f"- First-token time seconds: `{max((float(row['timing'].get('first_token_seconds', 0)) for row in rows), default=0):.6f}`",
-            f"- Decode tokens per second: `{float(performance.get('decode_tokens_per_second', 0)):.6f}`",
+            f"- Decode tokens per second: `{float(performance.get('decode_tokens_per_second', 0)):.6f}` (smoke, not a throughput measurement)",
         ])
+        determinism = summary.get("determinism", {})
+        lines.extend([
+            "",
+            "## Determinism",
+            "",
+            f"- Status: `{determinism.get('status', 'not-recorded')}`",
+            f"- Repeats: `{determinism.get('repeats', 1)}`",
+            f"- Token IDs identical: `{str(bool(determinism.get('identical_token_ids'))).lower()}`",
+            f"- Text identical: `{str(bool(determinism.get('identical_text'))).lower()}`",
+        ])
+        for case in determinism.get("cases", []):
+            lines.append(f"- `{case.get('case_id', 'unknown')}` repeat hashes:")
+            for repeat in case.get("per_repeat_hashes", []):
+                lines.append(
+                    f"  - repeat `{repeat.get('repeat')}`: response "
+                    f"`{repeat.get('response_sha256')}`, token IDs "
+                    f"`{repeat.get('token_ids_sha256')}`"
+                )
     lines.extend([
         "",
         "## Resources",
@@ -137,7 +156,7 @@ def render_report(
         lines.extend([
             f"- Disk free before bytes: `{int(resources.get('disk_free_before_bytes', 0) or 0)}`",
             f"- Disk free after bytes: `{int(resources.get('disk_free_after_bytes', 0) or 0)}`",
-            f"- Memory pressure after: `{resources.get('memory_pressure_after', 'unavailable')}`",
+            f"- Memory percent-free after: `{resources.get('memory_pressure_after', 'unavailable')}`",
             f"- Swap delta bytes: `{resources.get('swap_delta_bytes', 'unavailable')}`",
         ])
     lines.extend([
@@ -177,6 +196,9 @@ def compare_runs(run_a: Path, run_b: Path, *, output: Path | None = None, allow_
         raise ResultArtifactError(f"Fixed-invariant mismatch: {details}")
 
     model_variables = _model_variable_differences(manifest_a, manifest_b)
+    determinism_status = _cross_run_determinism(
+        manifest_a, rows_a, manifest_b, rows_b
+    )
     markdown = render_compare(
         manifest_a,
         summary_a,
@@ -185,6 +207,7 @@ def compare_runs(run_a: Path, run_b: Path, *, output: Path | None = None, allow_
         mismatches=mismatches,
         model_variables=model_variables,
         qualitative=bool(mismatches),
+        determinism_status=determinism_status,
     )
 
     output_path = output or (
@@ -205,6 +228,7 @@ def render_compare(
     mismatches: list[dict[str, Any]],
     model_variables: list[dict[str, Any]],
     qualitative: bool,
+    determinism_status: str | None = None,
 ) -> str:
     """Render deterministic comparison Markdown."""
     title = "Qualitative comparison only" if qualitative else "Comparable run comparison"
@@ -262,6 +286,15 @@ def render_compare(
         f"`{_summary_value(summary_b, 'resources', 'memory_pressure_after')}`",
         f"- Swap delta bytes: `{_summary_int(summary_a, 'resources', 'swap_delta_bytes')}` -> "
         f"`{_summary_int(summary_b, 'resources', 'swap_delta_bytes')}`",
+    ])
+    if determinism_status is not None:
+        lines.extend([
+            "",
+            "## Determinism",
+            "",
+            f"- Cross-run response hashes: `{determinism_status}`",
+        ])
+    lines.extend([
         "",
         "## Caveats",
         "",
@@ -292,6 +325,41 @@ def _model_variable_differences(a: dict[str, Any], b: dict[str, Any]) -> list[di
         if av != bv:
             diffs.append({"key": key, "a": av, "b": bv})
     return diffs
+
+
+def _cross_run_determinism(
+    manifest_a: dict[str, Any],
+    rows_a: list[dict[str, Any]],
+    manifest_b: dict[str, Any],
+    rows_b: list[dict[str, Any]],
+) -> str | None:
+    required_identity = (
+        ("suite", "suite_hash"),
+        ("settings", "decoding"),
+        ("settings", "seed"),
+        ("model", "repo_id"),
+        ("model", "revision"),
+    )
+    if any(
+        _get_path(manifest_a, path) != _get_path(manifest_b, path)
+        for path in required_identity
+    ):
+        return None
+    hashes_a = {
+        str(row.get("case_id")): row.get("response_sha256")
+        for row in rows_a
+        if isinstance(row.get("response_sha256"), str)
+        and len(row["response_sha256"]) == 64
+    }
+    hashes_b = {
+        str(row.get("case_id")): row.get("response_sha256")
+        for row in rows_b
+        if isinstance(row.get("response_sha256"), str)
+        and len(row["response_sha256"]) == 64
+    }
+    if not hashes_a or set(hashes_a) != set(hashes_b):
+        return None
+    return "identical" if hashes_a == hashes_b else "divergent"
 
 
 def _get_path(obj: dict[str, Any], path: tuple[str, ...]) -> Any:

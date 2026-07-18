@@ -91,6 +91,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Random seed for reproducibility",
     )
     smoke_p.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="Repeat the same generation after one model load (1-5; default: 1)",
+    )
+    smoke_p.add_argument(
         "--output-root",
         default="benchmark_results",
         help="Output root directory (default: benchmark_results)",
@@ -340,6 +346,7 @@ def _cmd_smoke(args: argparse.Namespace) -> int:
                 max_kv_size=args.max_kv_size,
                 allow_download=args.allow_download,
                 promotion_source=args.promotion_source,
+                repeats=getattr(args, "repeats", 1),
             )
         )
         manifest, rows, summary = load_run_artifacts(run_dir)

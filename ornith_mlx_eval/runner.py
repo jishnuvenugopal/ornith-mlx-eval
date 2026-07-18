@@ -13,6 +13,7 @@ import platform
 import re
 import subprocess
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,8 +29,29 @@ from ornith_mlx_eval.mlx_session import (
     SIX_BIT_MODEL,
     SUPPORTED_MODEL_SHAS,
     generate_with_mlx,
+    open_mlx_session,
     validate_6bit_promotion_source,
 )
+
+
+_DEFAULT_GENERATE_WITH_MLX = generate_with_mlx
+
+
+class _InjectedGenerationSession:
+    """Compatibility seam for pre-session fake-generation tests."""
+
+    def __init__(self, model_id: str, revision: str) -> None:
+        self.model_id = model_id
+        self.revision = revision
+
+    def __enter__(self) -> "_InjectedGenerationSession":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    def generate(self, prompt: str, options: MlxGenerationOptions):
+        return generate_with_mlx(self.model_id, self.revision, prompt, options)
 from ornith_mlx_eval.parsing import parse_response
 from ornith_mlx_eval.profile import DISK_HEADROOM_BYTES, run_profile
 from ornith_mlx_eval.reporting import render_report
@@ -74,9 +96,16 @@ class RunOptions:
     max_kv_size: int | None = None
     allow_download: bool = False
     promotion_source: str | None = None
+    repeats: int = 1
 
 
-def run_evaluation(options: RunOptions) -> Path:
+def run_evaluation(
+    options: RunOptions,
+    *,
+    mlx_api: Any | None = None,
+    clock: Any = time.perf_counter,
+    resource_probe: Any | None = None,
+) -> Path:
     """Run an evaluation and return the completed run directory."""
     _validate_run_options(options)
     if options.runtime not in {"mock", "mlx"}:
@@ -117,7 +146,15 @@ def run_evaluation(options: RunOptions) -> Path:
         if options.runtime == "mock":
             rows = _run_mock_cases(manifest, selected_cases)
         else:
-            rows = _run_mlx_cases(manifest, selected_cases, options)
+            rows = _run_mlx_cases(
+                manifest,
+                selected_cases,
+                options,
+                mlx_profile=mlx_profile or {},
+                mlx_api=mlx_api,
+                clock=clock,
+                resource_probe=resource_probe,
+            )
             _refresh_mlx_artifact_identity(manifest)
         classification = manifest["classification"]
         summary = summarize_rows(run_id, rows, classification=classification, limit=options.limit)
@@ -143,6 +180,21 @@ def run_evaluation(options: RunOptions) -> Path:
             ]
             raise ResultArtifactError(
                 f"MLX resource stop ({'; '.join(reasons)}); artifacts: {run_dir}"
+            )
+        missing_metrics = [
+            error["message"]
+            for row in rows
+            for error in row.get("errors", [])
+            if error.get("type") == "missing_metrics"
+        ]
+        if missing_metrics:
+            raise ResultArtifactError(
+                "MLX generation token metrics failure "
+                f"({'; '.join(missing_metrics)}); artifacts: {run_dir}"
+            )
+        if summary.get("determinism", {}).get("status") == "divergent":
+            raise ResultArtifactError(
+                f"MLX determinism divergence; artifacts: {run_dir}"
             )
         return run_dir
     except Exception as exc:
@@ -314,6 +366,7 @@ def _build_manifest(
         },
         "settings": {
             "seed": seed,
+            "repeats": options.repeats,
             "decoding": decoding,
             "limit": options.limit,
             "prompt_order": [str(case.get("case_id", "")) for case in selected_cases],
@@ -392,6 +445,11 @@ def _run_mlx_cases(
     manifest: dict[str, Any],
     cases: list[dict[str, Any]],
     options: RunOptions,
+    *,
+    mlx_profile: dict[str, Any],
+    mlx_api: Any | None,
+    clock: Any,
+    resource_probe: Any | None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     revision = manifest["model"]["revision"]
@@ -406,117 +464,213 @@ def _run_mlx_cases(
         max_kv_size=manifest["settings"]["decoding"]["max_kv_size"],
         enable_thinking=manifest["settings"]["decoding"]["enable_thinking"],
     )
-    for index, case in enumerate(cases):
-        chat_template_applied = False
-        timing = {
-            "cold_load_seconds": 0.0,
-            "wall_seconds": 0.0,
-            "first_token_seconds": 0.0,
-            "decode_seconds": 0.0,
-            "decode_tokens_per_second": 0.0,
-            "prompt_tokens_per_second": 0.0,
-        }
-        resources: dict[str, Any] = {
-            "peak_mlx_memory_bytes": 0,
-            "disk_free_before_bytes": 0,
-            "disk_free_after_bytes": 0,
-            "memory_pressure_before": None,
-            "memory_pressure_after": None,
-            "swap_used_before_bytes": None,
-            "swap_used_after_bytes": None,
-            "swap_delta_bytes": None,
-            "resource_stop_reason": None,
-        }
-        try:
-            generation = generate_with_mlx(
-                model_id,
-                revision,
-                render_prompt(case),
-                gen_options,
-            )
-            raw_response = generation.raw_text
-            prompt_tokens = generation.prompt_tokens
-            generated_tokens = generation.generated_tokens
-            peak_memory = generation.peak_mlx_memory_bytes
-            chat_template_applied = generation.chat_template_applied
-            case_errors: list[dict[str, str]] = []
+    max_working_set = int(
+        _profile_check_details(mlx_profile, "metal").get(
+            "max_recommended_working_set_size", 0
+        )
+        or 0
+    )
+    if max_working_set <= 0:
+        raise ResultArtifactError("MLX profile did not provide a working-set limit")
+    memory_limit_bytes = int(max_working_set * 0.85)
+    manifest["runtime"]["memory_limit_bytes"] = memory_limit_bytes
+    open_kwargs: dict[str, Any] = {
+        "api": mlx_api,
+        "clock": clock,
+        "memory_limit_bytes": memory_limit_bytes,
+    }
+    if resource_probe is not None:
+        open_kwargs["resource_probe"] = resource_probe
+
+    session_context = (
+        _InjectedGenerationSession(model_id, revision)
+        if mlx_api is None and generate_with_mlx is not _DEFAULT_GENERATE_WITH_MLX
+        else open_mlx_session(
+            model_id,
+            revision,
+            gen_options,
+            **open_kwargs,
+        )
+    )
+    with session_context as session:
+        for index, case in enumerate(cases):
+            chat_template_applied = False
             timing = {
-                "cold_load_seconds": generation.cold_load_seconds,
-                "wall_seconds": generation.wall_seconds,
-                "first_token_seconds": generation.first_token_seconds,
-                "decode_seconds": generation.decode_seconds,
-                "decode_tokens_per_second": generation.decode_tokens_per_second,
-                "prompt_tokens_per_second": generation.prompt_tokens_per_second,
+                "cold_load_seconds": 0.0,
+                "wall_seconds": 0.0,
+                "first_token_seconds": 0.0,
+                "decode_seconds": 0.0,
+                "decode_tokens_per_second": 0.0,
+                "prompt_tokens_per_second": 0.0,
+                "runtime_reported_tps": 0.0,
             }
-            swap_delta = None
-            if (
-                generation.swap_used_before_bytes is not None
-                and generation.swap_used_after_bytes is not None
-            ):
-                swap_delta = (
-                    generation.swap_used_after_bytes - generation.swap_used_before_bytes
-                )
-            resources = {
-                "peak_mlx_memory_bytes": peak_memory,
-                "disk_free_before_bytes": generation.disk_free_before_bytes,
-                "disk_free_after_bytes": generation.disk_free_after_bytes,
-                "memory_pressure_before": generation.memory_pressure_before,
-                "memory_pressure_after": generation.memory_pressure_after,
-                "swap_used_before_bytes": generation.swap_used_before_bytes,
-                "swap_used_after_bytes": generation.swap_used_after_bytes,
-                "swap_delta_bytes": swap_delta,
+            resources: dict[str, Any] = {
+                "peak_mlx_memory_bytes": 0,
+                "disk_free_before_bytes": 0,
+                "disk_free_after_bytes": 0,
+                "memory_pressure_before": None,
+                "memory_pressure_after": None,
+                "swap_used_before_bytes": None,
+                "swap_used_after_bytes": None,
+                "swap_delta_bytes": None,
                 "resource_stop_reason": None,
             }
-            stop_reason = _resource_stop_reason(manifest, timing, resources)
-            if stop_reason:
-                resources["resource_stop_reason"] = stop_reason
-                case_errors.append({"type": "resource_stop", "message": stop_reason})
-        except MlxSessionError as exc:
-            raw_response = ""
-            prompt_tokens = len(render_prompt(case).split())
-            generated_tokens = 0
-            peak_memory = 0
-            case_errors = [{"type": "runtime_error", "message": str(exc)}]
+            response_sha256 = ""
+            token_ids_sha256 = ""
+            determinism: dict[str, Any] = {
+                "repeats": options.repeats,
+                "identical_token_ids": False,
+                "identical_text": False,
+                "per_repeat_hashes": [],
+            }
+            try:
+                generations = [
+                    session.generate(render_prompt(case), gen_options)
+                    for _ in range(options.repeats)
+                ]
+                generation = generations[0]
+                raw_response = generation.raw_text
+                prompt_tokens = generation.prompt_tokens
+                generated_tokens = generation.generated_tokens
+                chat_template_applied = generation.chat_template_applied
+                response_sha256 = generation.response_sha256
+                token_ids_sha256 = generation.token_ids_sha256
+                per_repeat_hashes = [
+                    {
+                        "repeat": repeat_index + 1,
+                        "response_sha256": result.response_sha256,
+                        "token_ids_sha256": result.token_ids_sha256,
+                    }
+                    for repeat_index, result in enumerate(generations)
+                ]
+                identical_text = len(
+                    {result.response_sha256 for result in generations}
+                ) == 1
+                identical_token_ids = len(
+                    {result.token_ids_sha256 for result in generations}
+                ) == 1
+                determinism = {
+                    "repeats": options.repeats,
+                    "identical_token_ids": identical_token_ids,
+                    "identical_text": identical_text,
+                    "per_repeat_hashes": per_repeat_hashes,
+                }
+                case_errors: list[dict[str, str]] = []
+                if not identical_text or not identical_token_ids:
+                    case_errors.append(
+                        {
+                            "type": "determinism_divergence",
+                            "message": "Repeated generation hashes diverged",
+                        }
+                    )
+                total_decode_seconds = sum(
+                    result.decode_seconds for result in generations
+                )
+                total_decode_tokens = sum(
+                    max(result.generated_tokens - 1, 0) for result in generations
+                )
+                timing = {
+                    "cold_load_seconds": sum(
+                        result.cold_load_seconds for result in generations
+                    ),
+                    "wall_seconds": sum(result.wall_seconds for result in generations),
+                    "first_token_seconds": generation.first_token_seconds,
+                    "decode_seconds": total_decode_seconds,
+                    "decode_tokens_per_second": (
+                        total_decode_tokens / total_decode_seconds
+                        if total_decode_seconds > 0
+                        else 0.0
+                    ),
+                    "prompt_tokens_per_second": generation.prompt_tokens_per_second,
+                    "runtime_reported_tps": generation.runtime_reported_tps,
+                }
+                first_generation = generations[0]
+                last_generation = generations[-1]
+                swap_delta = None
+                if (
+                    first_generation.swap_used_before_bytes is not None
+                    and last_generation.swap_used_after_bytes is not None
+                ):
+                    swap_delta = (
+                        last_generation.swap_used_after_bytes
+                        - first_generation.swap_used_before_bytes
+                    )
+                resources = {
+                    "peak_mlx_memory_bytes": max(
+                        result.peak_mlx_memory_bytes for result in generations
+                    ),
+                    "disk_free_before_bytes": first_generation.disk_free_before_bytes,
+                    "disk_free_after_bytes": last_generation.disk_free_after_bytes,
+                    "memory_pressure_before": first_generation.memory_pressure_before,
+                    "memory_pressure_after": last_generation.memory_pressure_after,
+                    "swap_used_before_bytes": first_generation.swap_used_before_bytes,
+                    "swap_used_after_bytes": last_generation.swap_used_after_bytes,
+                    "swap_delta_bytes": swap_delta,
+                    "resource_stop_reason": None,
+                }
+                stop_reason = _resource_stop_reason(manifest, timing, resources)
+                if stop_reason:
+                    resources["resource_stop_reason"] = stop_reason
+                    case_errors.append(
+                        {"type": "resource_stop", "message": stop_reason}
+                    )
+            except MlxSessionError as exc:
+                raw_response = ""
+                prompt_tokens = len(render_prompt(case).split())
+                generated_tokens = 0
+                error_type = (
+                    "missing_metrics"
+                    if "generation token metrics" in str(exc)
+                    else "runtime_error"
+                )
+                case_errors = [{"type": error_type, "message": str(exc)}]
 
-        parsed = parse_response(raw_response)
-        grader = case.get("grader", {})
-        expected = _expected_value(case)
-        grade_result = grade(parsed, expected, grader.get("type"), _grader_options(grader))
-        if not grade_result.passed:
-            case_errors.append({"type": "case_failure", "message": grade_result.reason})
+            parsed = parse_response(raw_response)
+            grader = case.get("grader", {})
+            expected = _expected_value(case)
+            grade_result = grade(
+                parsed, expected, grader.get("type"), _grader_options(grader)
+            )
+            if not grade_result.passed:
+                case_errors.append(
+                    {"type": "case_failure", "message": grade_result.reason}
+                )
 
-        rows.append({
-            "schema_version": SCHEMA_VERSION,
-            "run_id": manifest["run_id"],
-            "case_id": str(case.get("case_id", f"case-{index}")),
-            "case_index": index,
-            "scored": True,
-            "category": "smoke",
-            "prompt_hash": compute_case_prompt_hash(case),
-            "prompt_chars": len(render_prompt(case)),
-            "raw_response": raw_response,
-            "parse": {
-                "status": parsed.parse_status,
-                "is_truncated": parsed.is_truncated,
-                "reasoning_text": parsed.reasoning_text,
-                "final_text": parsed.final_text,
-            },
-            "grade": {
-                "passed": bool(grade_result.passed),
-                "score": float(grade_result.score),
-                "reason": grade_result.reason,
-                "grader_type": grade_result.grader_type,
-                "evidence": grade_result.evidence,
-            },
-            "timing": timing,
-            "tokens": {
-                "prompt": prompt_tokens,
-                "generated": generated_tokens,
-                "chat_template_applied": chat_template_applied,
-            },
-            "resources": resources,
-            "errors": case_errors,
-        })
+            rows.append({
+                "schema_version": SCHEMA_VERSION,
+                "run_id": manifest["run_id"],
+                "case_id": str(case.get("case_id", f"case-{index}")),
+                "case_index": index,
+                "scored": True,
+                "category": "smoke",
+                "prompt_hash": compute_case_prompt_hash(case),
+                "prompt_chars": len(render_prompt(case)),
+                "raw_response": raw_response,
+                "response_sha256": response_sha256,
+                "token_ids_sha256": token_ids_sha256,
+                "determinism": determinism,
+                "parse": {
+                    "status": parsed.parse_status,
+                    "is_truncated": parsed.is_truncated,
+                    "reasoning_text": parsed.reasoning_text,
+                    "final_text": parsed.final_text,
+                },
+                "grade": {
+                    "passed": bool(grade_result.passed),
+                    "score": float(grade_result.score),
+                    "reason": grade_result.reason,
+                    "grader_type": grade_result.grader_type,
+                    "evidence": grade_result.evidence,
+                },
+                "timing": timing,
+                "tokens": {
+                    "prompt": prompt_tokens,
+                    "generated": generated_tokens,
+                    "chat_template_applied": chat_template_applied,
+                },
+                "resources": resources,
+                "errors": case_errors,
+            })
     if rows and all(
         any(error.get("type") == "runtime_error" for error in row.get("errors", []))
         for row in rows
@@ -674,6 +828,13 @@ def _compact_profile_checks(profile: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
+def _profile_check_details(profile: dict[str, Any], name: str) -> dict[str, Any]:
+    for check in profile.get("checks", []):
+        if check.get("name") == name and isinstance(check.get("details"), dict):
+            return check["details"]
+    return {}
+
+
 def _cached_snapshot_status(model_id: str, revision: str) -> dict[str, Any]:
     hf_home = Path(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")))
     snapshot = (
@@ -773,7 +934,7 @@ def _add_mlx_summary_metrics(summary: dict[str, Any], rows: list[dict[str, Any]]
         "wall_seconds": sum(float(row["timing"]["wall_seconds"]) for row in rows),
         "generated_tokens": sum(int(row["tokens"]["generated"]) for row in rows),
         "decode_tokens_per_second": (
-            sum(int(row["tokens"]["generated"]) for row in rows)
+            sum(max(int(row["tokens"]["generated"]) - 1, 0) for row in rows)
             / sum(float(row["timing"]["decode_seconds"]) for row in rows)
             if sum(float(row["timing"]["decode_seconds"]) for row in rows) > 0
             else 0.0
@@ -810,6 +971,48 @@ def _add_mlx_summary_metrics(summary: dict[str, Any], rows: list[dict[str, Any]]
         for row in rows
         if any(error.get("type") == "resource_stop" for error in row.get("errors", []))
     )
+    successful_rows = [
+        row
+        for row in rows
+        if not any(
+            error.get("type") in {"runtime_error", "missing_metrics"}
+            for error in row.get("errors", [])
+        )
+    ]
+    identical_token_ids = bool(successful_rows) and all(
+        row.get("determinism", {}).get("identical_token_ids") is True
+        for row in successful_rows
+    )
+    identical_text = bool(successful_rows) and all(
+        row.get("determinism", {}).get("identical_text") is True
+        for row in successful_rows
+    )
+    summary["determinism"] = {
+        "repeats": max(
+            (int(row.get("determinism", {}).get("repeats", 1)) for row in rows),
+            default=1,
+        ),
+        "identical_token_ids": identical_token_ids,
+        "identical_text": identical_text,
+        "status": (
+            "unavailable"
+            if not successful_rows
+            else (
+                "identical"
+                if identical_token_ids and identical_text
+                else "divergent"
+            )
+        ),
+        "cases": [
+            {
+                "case_id": row["case_id"],
+                "per_repeat_hashes": row.get("determinism", {}).get(
+                    "per_repeat_hashes", []
+                ),
+            }
+            for row in successful_rows
+        ],
+    }
 
 
 def _runtime_package_versions() -> dict[str, str]:
@@ -823,6 +1026,8 @@ def _runtime_package_versions() -> dict[str, str]:
 
 
 def _validate_run_options(options: RunOptions) -> None:
+    if options.repeats < 1 or options.repeats > 5:
+        raise ResultArtifactError("--repeats must be between 1 and 5")
     if options.limit is not None and options.limit <= 0:
         raise ResultArtifactError("--limit must be a positive integer")
     if options.max_tokens is not None and options.max_tokens <= 0:
